@@ -146,7 +146,7 @@ if __name__ == "__main__":
     print("Démarrage du pipeline Dynamic Pricing...")
     
     # 1. Charger le fichier Google Drive / CSV Matrice
-    # (Remplace 'matrice_prix_marges.csv' par le chemin de ton fichier ou l'API Google Drive)
+    # (On remplace 'matrice_prix_marges.csv' par le chemin du fichier ou l'API Google Drive)
     chemin_matrice = "matrice_prix_marges.csv"
     
     if os.path.exists(chemin_matrice):
