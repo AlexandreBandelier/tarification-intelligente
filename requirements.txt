@@ -1,4 +1,5 @@
-woocommerce
 pandas
+woocommerce
+python-dotenv
 requests
 gspread
