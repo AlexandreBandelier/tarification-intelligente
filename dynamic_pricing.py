@@ -1,22 +1,3 @@
-**Non, attention !** Il manque deux blocs indispensables pour que le fichier s'exécute de manière autonome sans renvoyer d'erreur `NameError`.
-
-Si tu lances ce fichier tel quel, Python va planter sur la ligne :
-`nouveau_prix, statut_calcul = calculer_prix_dynamique(row)`
-parce qu'il ne sait pas ce qu'est `calculer_prix_dynamique(row)`.
-
----
-
-### 🧩 Les 2 éléments à ajouter dans ce fichier :
-
-1. **La fonction `calculer_prix_dynamique(row)**` : C'est le bloc qu'on a défini précédemment avec toute la logique métier (Disjoncteur, Rupture concurrent, Corridor Asymétrique, Stock faible, etc.).
-2. **Le bloc d'exécution principal (`if __name__ == "__main__":`)** : C'est la ligne de commande à la toute fin du fichier qui charge les variables `.env`, télécharge ton Google Sheet, appelle la fonction de mise à jour, et réenregistre le Google Sheet mis à jour.
-
----
-
-### 📄 Le Fichier Python Complet (`dynamic_pricing.py`)
-
-Voici le fichier complet, prêt à être copié-collé dans ton projet :
-
 ```python
 import os
 import pandas as pd
@@ -26,9 +7,7 @@ from dotenv import load_dotenv
 # Chargement des variables d'environnement (.env en local, Render en production)
 load_dotenv()
 
-# =====================================================================
 # 1. CONFIGURATION DE L'API WOOCOMMERCE
-# =====================================================================
 wcapi = API(
     url=os.getenv("WOOCOMMERCE_URL"),
     consumer_key=os.getenv("WC_CONSUMER_KEY"),
@@ -37,9 +16,7 @@ wcapi = API(
 )
 
 
-# =====================================================================
 # 2. MOTEUR ALGORTIHMIQUE DE TARIFICATION DYNAMIQUE
-# =====================================================================
 def calculer_prix_dynamique(row):
     """
     Applique la matrice complète : Disjoncteur, Ruptures, Zones Geo,
@@ -104,9 +81,7 @@ def calculer_prix_dynamique(row):
     return prix_final, "OK"
 
 
-# =====================================================================
 # 3. FONCTION DE MISE À JOUR BATCH WOOCOMMERCE
-# =====================================================================
 def mettre_a_jour_prix_woocommerce(df_matrice):
     batch_data = []
     
@@ -122,7 +97,7 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
             break
         page += 1
 
-    print(f"📦 {len(tous_les_produits)} produits récupérés depuis WooCommerce.")
+    print(f"{len(tous_les_produits)} produits récupérés depuis WooCommerce.")
 
     # Évaluation par produit
     for produit in tous_les_produits:
@@ -159,18 +134,16 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
         for i in range(0, len(batch_data), 100):
             paquet = batch_data[i:i + 100]
             wcapi.post("products/batch", {"update": paquet})
-        print(f"✅ {len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
+        print(f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
     else:
-        print("ℹ️ Tous les prix WooCommerce sont déjà parfaitement optimisés.")
+        print("Tous les prix WooCommerce sont déjà parfaitement optimisés.")
 
     return df_matrice
 
 
-# =====================================================================
 # 4. POINT D'ENTRÉE DU SCRIPT (EXÉCUTION)
-# =====================================================================
 if __name__ == "__main__":
-    print("🚀 Démarrage du pipeline Dynamic Pricing...")
+    print("Démarrage du pipeline Dynamic Pricing...")
     
     # 1. Charger le fichier Google Drive / CSV Matrice
     # (Remplace 'matrice_prix_marges.csv' par le chemin de ton fichier ou l'API Google Drive)
@@ -184,8 +157,8 @@ if __name__ == "__main__":
         
         # 3. Sauvegarder l'état mis à jour (Compteurs disjoncteur, statuts)
         df_resultat.to_csv(chemin_matrice, index=False)
-        print("💾 Fichier Matrice mis à jour et sauvegardé.")
+        print("Fichier Matrice mis à jour et sauvegardé.")
     else:
-        print(f"❌ Erreur : Le fichier {chemin_matrice} est introuvable.")
+        print(f"Erreur : Le fichier {chemin_matrice} est introuvable.")
 
 ```
