@@ -50,7 +50,7 @@ def calculer_prix_dynamique(row):
 
     # 1. Protection Disjoncteur
     if float(row.get('Nb_Baisses_48h', 0) or 0) >= 3:
-        return round(prix_standard * 1.05, 2), "DISJONCTEUR_ACTIF"
+        return round(prix_standard, 2), "DISJONCTEUR_ACTIF"
 
     # 2. Détermination du concurrent cible (Gestion des ruptures)
     prix_comp, port_comp = None, None
