@@ -1,44 +1,20 @@
-name: Workflow Tarification Dynamique WooCommerce
-
-on:
-  schedule:
-    - cron: '0 6 * * *' # Tous les jours à 6h00 UTC
-  workflow_dispatch:
-
-jobs:
-  mise-a-jour-prix:
-    runs-on: ubuntu-latest
-
-    steps:
+steps:
       - name: Récupérer le code du dépôt
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configurer Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Installer les dépendances
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy gdown woocommerce requests beautifulsoup4
+          pip install -r requirements.txt
 
-      # ÉTAPE 1 : Synchro WooCommerce vers Matrice
-      - name: Synchroniser WooCommerce avec la matrice
+      - name: Exécuter le script de tarification
         env:
-          DRIVE_ID_MATRICE: ${{ secrets.DRIVE_ID_MATRICE }}
-          URL_SITE: ${{ secrets.URL_SITE }}
-          WOO_CONSUMER_KEY: ${{ secrets.WOO_CONSUMER_KEY }}
-          WOO_CONSUMER_SECRET: ${{ secrets.WOO_CONSUMER_SECRET }}
-        run: python 01_sync_woo_to_sheet.py
-
-      # ÉTAPE 2 : Scraping des fournisseurs
-      - name: Scraper les prix fournisseurs
-        run: python 02_scraper_fournisseurs.py
-
-      # ÉTAPE 3 : Calcul et mise à jour WooCommerce
-      - name: Exécuter la mise à jour dynamique des prix
-        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           DRIVE_ID_MATRICE: ${{ secrets.DRIVE_ID_MATRICE }}
           URL_SITE: ${{ secrets.URL_SITE }}
           WOO_CONSUMER_KEY: ${{ secrets.WOO_CONSUMER_KEY }}
