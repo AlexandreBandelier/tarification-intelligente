@@ -23,54 +23,68 @@ HEADERS = {
 
 # --- 2. FONCTIONS DE SCRAPING ET EXTRACTION ---
 def extraire_donnees_fournisseur(url):
-    """
-    Va chercher la page HTML et tente de repérer le prix et le statut du stock.
-    """
-    if not url or pd.isna(url) or not str(url).startswith('http'):
+    """Va chercher la page HTML et tente de repérer le prix et le statut du stock."""
+    if not url or pd.isna(url) or not str(url).startswith("http"):
         return None, None, None
 
     try:
         response = requests.get(str(url).strip(), headers=HEADERS, timeout=10)
         if response.status_code != 200:
-            print(f"  [!] Erreur HTTP {response.status_code} pour : {url}")
+            print(f"   [!] Erreur HTTP {response.status_code} pour : {url}")
             return None, None, "Erreur_HTTP"
 
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, "html.parser")
 
         # --- A. RECHERCHE DU PRIX ---
         prix = None
-        # Cherche les balises courantes de prix (Microdonnées Schema.org / Balises e-commerce classiques)
-        balise_prix = soup.find(attrs={"property": "product:price:amount"}) or \
-                      soup.find(attrs={"itemprop": "price"}) or \
-                      soup.find(class_=re.compile(r'price|prix', re.I))
+        balise_prix = (
+            soup.find(attrs={"property": "product:price:amount"})
+            or soup.find(attrs={"itemprop": "price"})
+            or soup.find(class_=re.compile(r"price|prix", re.I))
+        )
 
         if balise_prix:
-            valeur_texte = balise_prix.get('content') or balise_prix.text
-            # Nettoyage pour récupérer un nombre flottant (ex: "45,90 €" -> 45.90)
-            valeur_clean = re.sub(r'[^\d,. ]', '', valeur_texte).replace(',', '.').strip()
-            # Si espace millier ou doublons
-            match = re.search(r'\d+(\.\d{1,2})?', valeur_clean)
+            valeur_texte = balise_prix.get("content") or balise_prix.text
+
+            # 1. Nettoyage des espaces insécables et symboles
+            txt = (
+                valeur_texte.replace("\xa0", "")
+                .replace(" ", "")
+                .replace("€", "")
+                .strip()
+            )
+
+            # 2. Capture des motifs de prix (ex: "4,8", "4.8", "4,80", "1250,50")
+            match = re.search(r"(\d+[\.,]?\d*)", txt)
             if match:
-                prix = float(match.group(0))
+                raw_price = match.group(1).replace(",", ".")
+                try:
+                    prix = float(raw_price)
+                except ValueError:
+                    prix = None
 
         # --- B. RECHERCHE DE LA DISPONIBILITÉ (STOCK) ---
         dispo = "Rupture"
         texte_page = soup.get_text().lower()
-        
-        # Détecteurs génériques de stock
-        mots_stock = ["en stock", "in stock", "disponible", "en reapprovisionnement"]
+
+        mots_stock = [
+            "en stock",
+            "in stock",
+            "disponible",
+            "en reapprovisionnement",
+        ]
         mots_rupture = ["ecomprime", "hors stock", "out of stock", "rupture"]
 
-        if any(m in texte_page for m in mots_stock) and not any(r in texte_page for r in mots_rupture):
+        if any(m in texte_page for m in mots_stock) and not any(
+            r in texte_page for r in mots_rupture
+        ):
             dispo = "En stock"
 
-        # Frais de port par défaut (peut être ajusté ou extrait si présent)
         port = 0.0
-
         return prix, port, dispo
 
     except Exception as e:
-        print(f"  [!] Échec du scraping pour {url} : {e}")
+        print(f"   [!] Échec du scraping pour {url} : {e}")
         return None, None, "Erreur"
 
 # --- 3. EXÉCUTION DU SCRAPING SUR LA MATRICE ---
