@@ -24,7 +24,7 @@ if drive_id_matrice:
         gdown.download(url_standard, chemin_dest=chemin_matrice, quiet=False)
 
 # --- 2. CONFIGURATION DE L'API WOOCOMMERCE ---
-woo_url = os.environ.get("WOOCOMMERCE_URL") or os.environ.get("URL_SITE")
+woo_url = os.environ.get("URL_SITE") or os.environ.get("WOOCOMMERCE_URL")
 woo_ck = os.environ.get("WOO_CONSUMER_KEY") or os.environ.get("WC_CONSUMER_KEY")
 woo_cs = os.environ.get("WOO_CONSUMER_SECRET") or os.environ.get("WC_CONSUMER_SECRET")
 
