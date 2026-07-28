@@ -3,3 +3,4 @@ woocommerce
 python-dotenv
 requests
 gspread
+google-auth
