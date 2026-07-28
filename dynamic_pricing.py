@@ -295,17 +295,26 @@ def mettre_a_jour_prix():
             df_matrice.drop(columns=[col_temp], inplace=True)
 
     # --- 5. ÉCRITURE DANS LE GOOGLE SHEET EN LIGNE ---
-    print("Mise à jour en cours du Google Sheet en ligne...")
+    print("Mise à jour ciblée du Google Sheet en ligne...")
     try:
-        # Nettoyage des valeurs NaN pour éviter les erreurs d'envoi JSON
-        df_clean = df_matrice.fillna("")
+        # Récupération des en-têtes du sheet
+        headers = worksheet.row_values(1)
         
-        # Envoi des données complètes vers le Google Sheet
-        worksheet.clear()
-        worksheet.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
-        print("Le Google Sheet a été mis à jour directement en ligne avec succès !")
+        # Identification des colonnes à mettre à jour
+        col_prix = headers.index("Dernier_Prix_Calcule") + 1
+        col_statut = headers.index("Statut_Dernier_Calcul") + 1
+        
+        # Préparation des plages de mise à jour ciblées
+        vals_prix = [[val] for val in df_matrice["Dernier_Prix_Calcule"].fillna("").tolist()]
+        vals_statut = [[val] for val in df_matrice["Statut_Dernier_Calcul"].fillna("").tolist()]
+        
+        # On ne met à jour QUE ces colonnes précises (ligne 2 jusqu'à la fin)
+        worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_prix)}", vals_prix)
+        worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_statut)}", vals_statut)
+        
+        print("Seules les colonnes de calcul ont été mises à jour (données sources préservées) !")
     except Exception as e:
-        print(f"Erreur lors de l'écriture dans le Google Sheet : {e}")
+        print(f"Erreur lors de l'écriture ciblée dans le Google Sheet : {e}")
 
 
 # --- 6. POINT D'ENTRÉE ---
