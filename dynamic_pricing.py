@@ -103,18 +103,20 @@ def calculer_prix_dynamique(row):
         else:
             nouveau_prix = prix_standard
             statut = "REPLI_MONOPOLE_STANDARD"
-    else:
-        # 3. Calcul du Prix Total Cible (Zones Nordiques vs Sud)
+else:
+        # 3. CALCUL DU PRIX TOTAL CIBLE SELON LA ZONE GÉO (MODIFIÉ ICI)
+        cout_global_concurrent = prix_comp + port_comp
+        frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
+        prix_fr_brut = to_float(row.get("Prix_FR_Brut"))
+
         if str(row.get("Zone_Geo")).strip().upper() == "NORD":
-            cout_global_concurrent = prix_comp + port_comp
-            prix_cible = (cout_global_concurrent * 0.90) - to_float(
-                row.get("Frais_Port_Reels_Notre_Site")
-            )
-            prix_cible = max(
-                prix_cible, to_float(row.get("Prix_FR_Brut"))
-            )  # Plancher Flottant
+            # NORD : Objectif agressif (-10% vs concurrent)
+            prix_cible = (cout_global_concurrent * 0.90) - frais_port_notre_site
+            prix_cible = max(prix_cible, prix_fr_brut)  # Plancher flottant
         else:
-            prix_cible = prix_standard
+            # SUD : Objectif ajusté (Alignement direct sur le coût global du concurrent)
+            prix_cible = cout_global_concurrent - frais_port_notre_site
+            prix_cible = max(prix_cible, prix_plancher)
 
         # 4. Protection Stock Faible
         if (
