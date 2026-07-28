@@ -9,14 +9,28 @@ from woocommerce import API
 # --- 0. PARAMÈTRES DE SÉCURITÉ ---
 SEUIL_VARIATION_MAX = 0.25 
 
-
 def to_float(val, default=0.0):
-    """Convertit une valeur (texte avec virgule ou nombre) en float proprement."""
-    if pd.isna(val) or val is None or str(val).strip() == "":
+    """Convertit une valeur (ex: '4,8', '4,80 €', 4.8) en float de façon robuste."""
+    if pd.isna(val) or val is None:
         return float(default)
+    
+    # Si c'est déjà un nombre (int ou float)
+    if isinstance(val, (int, float)):
+        return float(val)
+    
+    # Nettoyage de la chaîne de caractères
+    s = str(val).strip()
+    if not s:
+        return float(default)
+    
+    # Suppression du symbole € et des espaces insécables
+    s = s.replace("€", "").replace("\xa0", "").replace(" ", "").strip()
+    
+    # Remplacement de la virgule par un point
+    s = s.replace(",", ".")
+    
     try:
-        clean_val = str(val).replace(",", ".").replace("\xa0", "").strip()
-        return float(clean_val)
+        return float(s)
     except (ValueError, TypeError):
         return float(default)
 
