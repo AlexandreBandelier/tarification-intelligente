@@ -1,11 +1,12 @@
 import os
 import sys
+import json
 import pandas as pd
-import gdown
+import gspread
+from google.oauth2.service_account import Credentials
 from woocommerce import API
 
 # --- 0. PARAMÈTRES DE SÉCURITÉ ---
-# Écart maximum autorisé par rapport au Prix Standard (25% par défaut)
 SEUIL_VARIATION_MAX = 0.25 
 
 
@@ -20,34 +21,44 @@ def to_float(val, default=0.0):
         return float(default)
 
 
-# --- 1. CONFIGURATION DES CHEMINS ET DRIVE ---
-dossier_actuel = os.path.dirname(os.path.abspath(__file__))
-chemin_matrice = os.path.join(dossier_actuel, "matrice_prix_marges.csv")
+# --- 1. CONNEXION ET LECTURE GOOGLE SHEETS VIA API ---
+print("Étape 1 : Connexion à Google Sheets...")
 
-drive_id_matrice = os.environ.get("DRIVE_ID_MATRICE") or os.environ.get(
-    "DRIVE_ID_PROD"
-)
+google_credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
+drive_id_matrice = os.environ.get("DRIVE_ID_MATRICE") or os.environ.get("DRIVE_ID_PROD")
 
-if drive_id_matrice:
-    print("Étape 1 : Téléchargement de la matrice de prix depuis Google Drive...")
-    url_csv = f"https://docs.google.com/spreadsheets/d/{drive_id_matrice}/export?format=csv"
-    try:
-        gdown.download(url_csv, chemin_matrice, quiet=False)
-    except Exception:
-        url_standard = f"https://drive.google.com/uc?id={drive_id_matrice}"
-        gdown.download(url_standard, chemin_dest=chemin_matrice, quiet=False)
+if not google_credentials_json or not drive_id_matrice:
+    print("Erreur : Les secrets GOOGLE_CREDENTIALS ou DRIVE_ID_MATRICE sont manquants.")
+    sys.exit(1)
+
+# Authentification gspread
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+creds_dict = json.loads(google_credentials_json)
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+gc = gspread.authorize(credentials)
+
+# Ouverture de la feuille de calcul
+try:
+    sh = gc.open_by_key(drive_id_matrice)
+    worksheet = sh.sheet1
+    data = worksheet.get_all_records()
+    df_matrice = pd.DataFrame(data)
+    print("Matrice de prix chargée avec succès depuis Google Sheets !")
+except Exception as e:
+    print(f"Erreur lors de l'accès au Google Sheet : {e}")
+    sys.exit(1)
+
 
 # --- 2. CONFIGURATION DE L'API WOOCOMMERCE ---
 woo_url = os.environ.get("URL_SITE") or os.environ.get("WOOCOMMERCE_URL")
 woo_ck = os.environ.get("WOO_CONSUMER_KEY") or os.environ.get("WC_CONSUMER_KEY")
-woo_cs = os.environ.get("WOO_CONSUMER_SECRET") or os.environ.get(
-    "WC_CONSUMER_SECRET"
-)
+woo_cs = os.environ.get("WOO_CONSUMER_SECRET") or os.environ.get("WC_CONSUMER_SECRET")
 
 if not woo_url or not woo_ck or not woo_cs:
-    print(
-        "Erreur : Secrets WooCommerce (URL, Key, Secret) manquants dans les variables d'environnement."
-    )
+    print("Erreur : Secrets WooCommerce manquants dans les variables d'environnement.")
     sys.exit(1)
 
 wcapi = API(
@@ -59,13 +70,8 @@ wcapi = API(
 )
 
 
-# --- 3. MOTEUR ALGORITHMIQUE DE TARIFICATION DYNAMIQUE AVEC GARDE-FOU ---
+# --- 3. MOTEUR ALGORITHMIQUE DE TARIFICATION DYNAMIQUE ---
 def calculer_prix_dynamique(row):
-    """Applique la matrice complète : Disjoncteur, Ruptures, Zones Geo,
-
-    Protection Stock Faible, Corridor Asymétrique, Surstock et Sécurité Ecart
-    Max.
-    """
     prix_standard = to_float(row.get("Prix_Standard_TTC"))
     prix_plancher = to_float(row.get("Prix_Plancher_TTC"))
 
@@ -76,22 +82,16 @@ def calculer_prix_dynamique(row):
     if to_float(row.get("Nb_Baisses_48h")) >= 3:
         return round(prix_standard, 2), "DISJONCTEUR_ACTIF"
 
-    # 2. Détermination du concurrent cible (Gestion des ruptures)
-    prix_comp, port_comp = None, None
-    if str(row.get("Dispo_Concurrent_1")).strip().lower() in [
-        "en stock",
-        "in stock",
-        "1",
-        "true",
-    ]:
+    # 2. Détermination du concurrent cible
+    prix_comp, port_comp = None, 0.0
+    
+    dispo_1 = str(row.get("Dispo_Concurrent_1") or "").strip().lower()
+    dispo_2 = str(row.get("Dispo_Concurrent_2") or "").strip().lower()
+
+    if dispo_1 in ["en stock", "in stock", "1", "true", "oui"]:
         prix_comp = to_float(row.get("Prix_Concurrent_1"))
         port_comp = to_float(row.get("Port_Concurrent_1"))
-    elif str(row.get("Dispo_Concurrent_2")).strip().lower() in [
-        "en stock",
-        "in stock",
-        "1",
-        "true",
-    ]:
+    elif dispo_2 in ["en stock", "in stock", "1", "true", "oui"]:
         prix_comp = to_float(row.get("Prix_Concurrent_2"))
         port_comp = to_float(row.get("Port_Concurrent_2"))
 
@@ -104,17 +104,15 @@ def calculer_prix_dynamique(row):
             nouveau_prix = prix_standard
             statut = "REPLI_MONOPOLE_STANDARD"
     else:
-        # 3. CALCUL DU PRIX TOTAL CIBLE SELON LA ZONE GÉO (MODIFIÉ ICI)
+        # 3. Calcul du Prix Total Cible
         cout_global_concurrent = prix_comp + port_comp
         frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
         prix_fr_brut = to_float(row.get("Prix_FR_Brut"))
 
         if str(row.get("Zone_Geo")).strip().upper() == "NORD":
-            # NORD : Objectif agressif (-10% vs concurrent)
             prix_cible = (cout_global_concurrent * 0.90) - frais_port_notre_site
-            prix_cible = max(prix_cible, prix_fr_brut)  # Plancher flottant
+            prix_cible = max(prix_cible, prix_fr_brut)
         else:
-            # SUD : Objectif ajusté (Alignement direct sur le coût global du concurrent)
             prix_cible = cout_global_concurrent - frais_port_notre_site
             prix_cible = max(prix_cible, prix_plancher)
 
@@ -135,8 +133,7 @@ def calculer_prix_dynamique(row):
             if delta >= -0.10 * prix_standard:
                 coeff = (
                     0.50
-                    if str(row.get("Is_Bestseller")).strip().lower()
-                    in ["oui", "yes", "true", "1"]
+                    if str(row.get("Is_Bestseller")).strip().lower() in ["oui", "yes", "true", "1"]
                     else 1.0
                 )
                 nouveau_prix = prix_standard + (delta * coeff)
@@ -148,7 +145,7 @@ def calculer_prix_dynamique(row):
 
         statut = "OK"
 
-    # 6. Sécurité Absolue : Prix Plancher Inviolable
+    # 6. Prix Plancher Inviolable
     prix_final = max(nouveau_prix, prix_plancher)
 
     # Arrondi
@@ -157,13 +154,10 @@ def calculer_prix_dynamique(row):
     else:
         prix_final = round(prix_final, 2)
 
-    # 7. BARRIÈRE DE SÉCURITÉ : VÉRIFICATION D'ÉCART ANORMAL
+    # 7. Barrière de Sécurité Écart Max
     variation = abs(prix_final - prix_standard) / prix_standard
     if variation > SEUIL_VARIATION_MAX:
-        # Bloque le changement automatique et demande une validation humaine
-        dernier_prix = to_float(
-            row.get("Dernier_Prix_Applique"), prix_standard
-        )
+        dernier_prix = to_float(row.get("Dernier_Prix_Applique"), prix_standard)
         return (
             dernier_prix,
             f"BLOCAGE_VARIATION_EXCESSIVE_({round(variation*100)}%)",
@@ -172,12 +166,12 @@ def calculer_prix_dynamique(row):
     return prix_final, statut
 
 
-# --- 4. MISE À JOUR WOOCOMMERCE ---
-def mettre_a_jour_prix_woocommerce(df_matrice):
+# --- 4. TRAITEMENT ET SYNCHRONISATION ---
+def mettre_a_jour_prix():
     batch_data = []
     produits_en_alerte = []
 
-    print("Récupération des produits depuis WooCommerce via l'API REST...")
+    print("Récupération des produits depuis WooCommerce...")
     tous_les_produits = []
     page = 1
     while True:
@@ -204,7 +198,6 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
 
     code_site_courant = "FR"
 
-    # Évaluation par produit WooCommerce
     for produit in tous_les_produits:
         sku = str(produit.get("sku", "")).strip()
         if not sku:
@@ -220,7 +213,6 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
         row = lignes.iloc[0].to_dict()
         row["Dernier_Prix_Applique"] = prix_actuel
 
-        # Calcul du nouveau prix sécurisé
         nouveau_prix, statut_calcul = calculer_prix_dynamique(row)
 
         df_matrice.loc[
@@ -230,7 +222,6 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
             df_matrice["Clave_Unique"] == cle_recherche, "Statut_Dernier_Calcul"
         ] = statut_calcul
 
-        # Capture des alertes pour le rapport final
         if "BLOCAGE_VARIATION_EXCESSIVE" in statut_calcul:
             produits_en_alerte.append(
                 {
@@ -241,7 +232,6 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
                 }
             )
 
-        # Application si valide et différent
         if (
             nouveau_prix > 0
             and nouveau_prix != prix_actuel
@@ -267,54 +257,44 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
                     "Nb_Baisses_48h",
                 ] = (current_baisses + 1)
 
-    # Envoi par paquets de 100
+    # Mise à jour WooCommerce
     if batch_data:
-        print(f"Envoi des modifications pour {len(batch_data)} produits...")
+        print(f"Envoi des modifications pour {len(batch_data)} produits sur WooCommerce...")
         for i in range(0, len(batch_data), 100):
             paquet = batch_data[i : i + 100]
-            resp = wcapi.post("products/batch", {"update": paquet})
-            print(f"  -> Paquet {i//100 + 1} envoyé sur WooCommerce.")
-        print(
-            f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce."
-        )
+            wcapi.post("products/batch", {"update": paquet})
+        print(f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
     else:
-        print(
-            "Tous les prix WooCommerce autorisés sont déjà parfaitement à jour."
-        )
+        print("Tous les prix WooCommerce autorisés sont déjà à jour.")
 
-    # RAPPORT DE SÉCURITÉ EN CONSOLE
     if produits_en_alerte:
-        print(
-            "\n--- ALERTE : PRODUITS NÉCESSITANT UNE VÉRIFICATION MANUELLE ---"
-        )
+        print("\n--- ALERTE : PRODUITS NÉCESSITANT UNE VÉRIFICATION MANUELLE ---")
         for p in produits_en_alerte:
             print(
                 f"  • SKU {p['SKU']} ({p['Nom']}) | Prix actuel : {p['Prix_Actuel']}€ | Motif : {p['Statut']}"
             )
-        print(
-            "--------------------------------------------------------------------\n"
-        )
+        print("--------------------------------------------------------------------\n")
 
+    # Nettoyage des colonnes de calcul temporaires
     for col_temp in ["SKU_Clean", "Clave_Unique"]:
         if col_temp in df_matrice.columns:
             df_matrice.drop(columns=[col_temp], inplace=True)
 
-    return df_matrice
+    # --- 5. ÉCRITURE DANS LE GOOGLE SHEET EN LIGNE ---
+    print("Mise à jour en cours du Google Sheet en ligne...")
+    try:
+        # Nettoyage des valeurs NaN pour éviter les erreurs d'envoi JSON
+        df_clean = df_matrice.fillna("")
+        
+        # Envoi des données complètes vers le Google Sheet
+        worksheet.clear()
+        worksheet.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
+        print("Le Google Sheet a été mis à jour directement en ligne avec succès !")
+    except Exception as e:
+        print(f"Erreur lors de l'écriture dans le Google Sheet : {e}")
 
 
-# --- 5. POINT D'ENTRÉE ---
+# --- 6. POINT D'ENTRÉE ---
 if __name__ == "__main__":
     print("Démarrage du pipeline Dynamic Pricing WooCommerce...")
-
-    if os.path.exists(chemin_matrice):
-        try:
-            df_matrice = pd.read_csv(chemin_matrice, low_memory=False)
-        except Exception:
-            df_matrice = pd.read_excel(chemin_matrice)
-
-        df_resultat = mettre_a_jour_prix_woocommerce(df_matrice)
-        df_resultat.to_csv(chemin_matrice, index=False, encoding="utf-8")
-        print("Fichier Matrice mis à jour et sauvegardé localement.")
-    else:
-        print(f"Erreur : Le fichier {chemin_matrice} est introuvable.")
-        sys.exit(1)
+    mettre_a_jour_prix()
