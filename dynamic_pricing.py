@@ -103,7 +103,7 @@ def calculer_prix_dynamique(row):
         else:
             nouveau_prix = prix_standard
             statut = "REPLI_MONOPOLE_STANDARD"
-else:
+    else:
         # 3. CALCUL DU PRIX TOTAL CIBLE SELON LA ZONE GÉO (MODIFIÉ ICI)
         cout_global_concurrent = prix_comp + port_comp
         frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
