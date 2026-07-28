@@ -1,8 +1,7 @@
-- name: Run WooCommerce Price Update
+- name: Exécuter la mise à jour dynamique des prix
         env:
-          WOOCOMMERCE_URL: ${{ secrets.URL_SITE }}
+          DRIVE_ID_MATRICE: ${{ secrets.DRIVE_ID_MATRICE }}
+          URL_SITE: ${{ secrets.URL_SITE }}
           WOO_CONSUMER_KEY: ${{ secrets.WOO_CONSUMER_KEY }}
           WOO_CONSUMER_SECRET: ${{ secrets.WOO_CONSUMER_SECRET }}
-          DRIVE_ID_PROD: ${{ secrets.DRIVE_ID_PROD }}
-        run: |
-          python 04_mise_a_jour_prix_site.py
+        run: python 04_dynamic_pricing_woo.py
