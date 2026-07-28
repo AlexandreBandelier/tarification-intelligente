@@ -32,12 +32,17 @@ else:
     print("Erreur : Impossible de charger le fichier téléchargé.")
     sys.exit(1)
 
-# Nettoyage des colonnes / Clé de jointure
+# --- CREATION DE LA CLÉ DE JOINTURE UNIQUE (PLACEMENT ICI) ---
 if 'SKU' not in df_matrice.columns:
     print("Erreur : La colonne 'SKU' est introuvable dans le Google Sheet.")
     sys.exit(1)
 
+if 'Code_Site' not in df_matrice.columns:
+    df_matrice['Code_Site'] = 'FR'
+
+df_matrice['Code_Site'] = df_matrice['Code_Site'].fillna('FR').astype(str).str.upper().str.strip()
 df_matrice['SKU_Clean'] = df_matrice['SKU'].astype(str).str.strip()
+df_matrice['Clave_Unique'] = df_matrice['SKU_Clean'] + "_" + df_matrice['Code_Site']
 
 # --- 2. CONFIGURATION DE L'API WOOCOMMERCE ---
 woo_url = os.environ.get("URL_SITE") or os.environ.get("WOOCOMMERCE_URL")
@@ -76,6 +81,7 @@ print(f"Total récupéré : {len(tous_les_produits)} produits WooCommerce.")
 # --- 4. SYNCHRONISATION / FUSION AVEC LA MATRICE ---
 print("\nÉtape 3 : Mise à jour des colonnes WooCommerce dans la matrice...")
 
+code_site_courant = "FR" # Déterminé par le site actuellement interrogé
 produits_mis_a_jour = 0
 nouveaux_produits = []
 
@@ -91,12 +97,14 @@ for prod in tous_les_produits:
     statut_stock = str(prod.get("stock_status", "instock")).lower()
     total_ventes = int(prod.get("total_sales") or 0)
 
-    # Vérification si le produit existe déjà dans le Google Sheet
-    idx = df_matrice.index[df_matrice['SKU_Clean'] == sku].tolist()
+    # Reconstitution de la clé unique côté WooCommerce
+    cle_recherche = sku + "_" + code_site_courant
+
+    # Vérification si le produit existe déjà dans la matrice pour ce site
+    idx = df_matrice.index[df_matrice['Clave_Unique'] == cle_recherche].tolist()
 
     if idx:
         row_i = idx[0]
-        # Mise à jour des données dynamiques sans écraser les autres colonnes
         df_matrice.loc[row_i, 'ID_WooCommerce'] = id_woo
         df_matrice.loc[row_i, 'Nom_Produit'] = nom
         if 'Prix_Standard_TTC' not in df_matrice.columns or pd.isna(df_matrice.loc[row_i, 'Prix_Standard_TTC']):
@@ -106,14 +114,15 @@ for prod in tous_les_produits:
         df_matrice.loc[row_i, 'Ventes_30_Jours'] = total_ventes
         produits_mis_a_jour += 1
     else:
-        # Si le produit est nouveau sur le site, on l'ajoute
+        # Ajout du nouveau produit avec son Code_Site
         nouvelle_ligne = {
             'ID_WooCommerce': id_woo,
             'SKU': sku,
+            'Code_Site': code_site_courant,
             'Nom_Produit': nom,
             'Prix_Standard_TTC': prix_regulier,
             'Dernier_Prix_Applique': prix_actuel,
-            'Prix_Plancher_TTC': round(prix_regulier * 0.70, 2), # Valeur par défaut (30% de marge max)
+            'Prix_Plancher_TTC': round(prix_regulier * 0.70, 2),
             'Prix_FR_Brut': round(prix_regulier * 0.50, 2),
             'Statut_Stock': statut_stock,
             'Ventes_30_Jours': total_ventes,
@@ -123,16 +132,16 @@ for prod in tous_les_produits:
         }
         nouveaux_produits.append(nouvelle_ligne)
 
-# Si de nouveaux produits ont été ajoutés sur le site
 if nouveaux_produits:
     df_nouveaux = pd.DataFrame(nouveaux_produits)
     df_matrice = pd.concat([df_matrice, df_nouveaux], ignore_index=True)
     print(f"{len(nouveaux_produits)} nouveaux produits ajoutés à la matrice.")
 
-# Nettoyage de la colonne temporaire
-if 'SKU_Clean' in df_matrice.columns:
-    df_matrice.drop(columns=['SKU_Clean'], inplace=True)
+# Nettoyage des colonnes temporaires
+for col_temp in ['SKU_Clean', 'Clave_Unique']:
+    if col_temp in df_matrice.columns:
+        df_matrice.drop(columns=[col_temp], inplace=True)
 
-# Sauvegarde locale du fichier mis à jour
+# Sauvegarde finale
 df_matrice.to_csv(chemin_matrice, index=False, encoding='utf-8')
 print(f"{produits_mis_a_jour} produits WooCommerce synchronisés avec succès dans la matrice.")
