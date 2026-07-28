@@ -1,4 +1,14 @@
-steps:
+name: Dynamic Pricing WooCommerce
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *' # (Optionnel) Exécution automatique toutes les 6 heures
+
+jobs:
+  run-pricing:
+    runs-on: ubuntu-latest
+    steps:
       - name: Récupérer le code du dépôt
         uses: actions/checkout@v4
 
