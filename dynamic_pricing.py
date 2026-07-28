@@ -4,6 +4,10 @@ import pandas as pd
 import gdown
 from woocommerce import API
 
+# --- 0. PARAMÈTRES DE SÉCURITÉ ---
+# Écart maximum autorisé par rapport au Prix Standard (25% par défaut)
+SEUIL_VARIATION_MAX = 0.25 
+
 # --- 1. CONFIGURATION DES CHEMINS ET DRIVE ---
 dossier_actuel = os.path.dirname(os.path.abspath(__file__))
 chemin_matrice = os.path.join(dossier_actuel, "matrice_prix_marges.csv")
@@ -17,7 +21,7 @@ if drive_id_matrice:
         gdown.download(url_csv, chemin_matrice, quiet=False)
     except Exception:
         url_standard = f"https://drive.google.com/uc?id={drive_id_matrice}"
-        gdown.download(url_standard, chemin_matrice, quiet=False)
+        gdown.download(url_standard, chemin_dest=chemin_matrice, quiet=False)
 
 # --- 2. CONFIGURATION DE L'API WOOCOMMERCE ---
 woo_url = os.environ.get("WOOCOMMERCE_URL") or os.environ.get("URL_SITE")
@@ -36,11 +40,11 @@ wcapi = API(
     timeout=60
 )
 
-# --- 3. MOTEUR ALGORTIHMIQUE DE TARIFICATION DYNAMIQUE ---
+# --- 3. MOTEUR ALGORITHMIQUE DE TARIFICATION DYNAMIQUE AVEC GARDE-FOU ---
 def calculer_prix_dynamique(row):
     """
     Applique la matrice complète : Disjoncteur, Ruptures, Zones Geo,
-    Protection Stock Faible, Corridor Asymétrique et Surstock.
+    Protection Stock Faible, Corridor Asymétrique, Surstock et Sécurité Ecart Max.
     """
     prix_standard = float(row.get('Prix_Standard_TTC', 0) or 0)
     prix_plancher = float(row.get('Prix_Plancher_TTC', 0) or 0)
@@ -64,34 +68,39 @@ def calculer_prix_dynamique(row):
     # Cas de Rupture Globale des concurrents
     if prix_comp is None or prix_comp <= 0:
         if str(row.get('Statut_Stock')).strip().lower() == "stock_faible":
-            return round(prix_standard * 1.05, 2), "REPLI_MONOPOLE_STOCK_FAIBLE"
-        return prix_standard, "REPLI_MONOPOLE_STANDARD"
-
-    # 3. Calcul du Prix Total Cible (Zones Nordiques vs Sud)
-    if str(row.get('Zone_Geo')).strip().upper() == "NORD":
-        cout_global_concurrent = prix_comp + port_comp
-        prix_cible = (cout_global_concurrent * 0.90) - float(row.get('Frais_Port_Reels_Notre_Site', 0) or 0)
-        prix_cible = max(prix_cible, float(row.get('Prix_FR_Brut', 0) or 0)) # Plancher Flottant
-    else:
-        prix_cible = prix_standard
-
-    # 4. Protection Stock Faible
-    if str(row.get('Statut_Stock')).strip().lower() == "stock_faible" and float(row.get('Ventes_30_Jours', 0) or 0) > 5:
-        return max(prix_standard, float(row.get('Dernier_Prix_Applique', 0) or 0)), "GEL_STOCK_FAIBLE"
-
-    # 5. Application du Corridor Asymétrique
-    if prix_cible > prix_standard:
-        nouveau_prix = prix_standard + ((prix_cible - prix_standard) * 0.66)
-    else:
-        delta = prix_cible - prix_standard
-        if delta >= -0.10 * prix_standard:
-            coeff = 0.50 if str(row.get('Is_Bestseller')).strip().lower() in ["oui", "yes", "true", "1"] else 1.0
-            nouveau_prix = prix_standard + (delta * coeff)
+            nouveau_prix = round(prix_standard * 1.05, 2)
+            statut = "REPLI_MONOPOLE_STOCK_FAIBLE"
         else:
-            nouveau_prix = prix_standard + (delta * 0.33)
+            nouveau_prix = prix_standard
+            statut = "REPLI_MONOPOLE_STANDARD"
+    else:
+        # 3. Calcul du Prix Total Cible (Zones Nordiques vs Sud)
+        if str(row.get('Zone_Geo')).strip().upper() == "NORD":
+            cout_global_concurrent = prix_comp + port_comp
+            prix_cible = (cout_global_concurrent * 0.90) - float(row.get('Frais_Port_Reels_Notre_Site', 0) or 0)
+            prix_cible = max(prix_cible, float(row.get('Prix_FR_Brut', 0) or 0)) # Plancher Flottant
+        else:
+            prix_cible = prix_standard
 
-    if str(row.get('Statut_Stock')).strip().lower() == "surstock":
-        nouveau_prix *= 0.95
+        # 4. Protection Stock Faible
+        if str(row.get('Statut_Stock')).strip().lower() == "stock_faible" and float(row.get('Ventes_30_Jours', 0) or 0) > 5:
+            return max(prix_standard, float(row.get('Dernier_Prix_Applique', 0) or 0)), "GEL_STOCK_FAIBLE"
+
+        # 5. Application du Corridor Asymétrique
+        if prix_cible > prix_standard:
+            nouveau_prix = prix_standard + ((prix_cible - prix_standard) * 0.66)
+        else:
+            delta = prix_cible - prix_standard
+            if delta >= -0.10 * prix_standard:
+                coeff = 0.50 if str(row.get('Is_Bestseller')).strip().lower() in ["oui", "yes", "true", "1"] else 1.0
+                nouveau_prix = prix_standard + (delta * coeff)
+            else:
+                nouveau_prix = prix_standard + (delta * 0.33)
+
+        if str(row.get('Statut_Stock')).strip().lower() == "surstock":
+            nouveau_prix *= 0.95
+
+        statut = "OK"
 
     # 6. Sécurité Absolue : Prix Plancher Inviolable
     prix_final = max(nouveau_prix, prix_plancher)
@@ -102,11 +111,19 @@ def calculer_prix_dynamique(row):
     else:
         prix_final = round(prix_final, 2)
 
-    return prix_final, "OK"
+    # 🛡️ 7. BARRIÈRE DE SÉCURITÉ : VÉRIFICATION D'ÉCART ANORMAL
+    variation = abs(prix_final - prix_standard) / prix_standard
+    if variation > SEUIL_VARIATION_MAX:
+        # Bloque le changement automatique et demande une validation humaine
+        dernier_prix = float(row.get('Dernier_Prix_Applique', 0) or prix_standard)
+        return dernier_prix, f"BLOCAGE_VARIATION_EXCESSIVE_({round(variation*100)}%)"
+
+    return prix_final, statut
 
 # --- 4. MISE À JOUR WOOCOMMERCE ---
 def mettre_a_jour_prix_woocommerce(df_matrice):
     batch_data = []
+    produits_en_alerte = []
     
     print("Récupération des produits depuis WooCommerce via l'API REST...")
     tous_les_produits = []
@@ -139,13 +156,23 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
         row = lignes.iloc[0].to_dict()
         row['Dernier_Prix_Applique'] = prix_actuel
 
-        # Calcul du nouveau prix
+        # Calcul du nouveau prix sécurisé
         nouveau_prix, statut_calcul = calculer_prix_dynamique(row)
 
         df_matrice.loc[df_matrice['SKU_Clean'] == sku, 'Dernier_Prix_Calcule'] = nouveau_prix
         df_matrice.loc[df_matrice['SKU_Clean'] == sku, 'Statut_Dernier_Calcul'] = statut_calcul
 
-        if nouveau_prix > 0 and nouveau_prix != prix_actuel:
+        # Capture des alertes pour le rapport final
+        if "BLOCAGE_VARIATION_EXCESSIVE" in statut_calcul:
+            produits_en_alerte.append({
+                "SKU": sku,
+                "Nom": produit.get("name"),
+                "Prix_Actuel": prix_actuel,
+                "Statut": statut_calcul
+            })
+
+        # Application si valide et différent
+        if nouveau_prix > 0 and nouveau_prix != prix_actuel and "BLOCAGE" not in statut_calcul:
             payload_produit = {
                 "id": produit["id"],
                 "regular_price": str(nouveau_prix)
@@ -163,9 +190,16 @@ def mettre_a_jour_prix_woocommerce(df_matrice):
             paquet = batch_data[i:i + 100]
             resp = wcapi.post("products/batch", {"update": paquet})
             print(f"  -> Paquet {i//100 + 1} envoyé sur WooCommerce.")
-        print(f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
+        print(f"✅ {len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
     else:
-        print("Tous les prix WooCommerce sont déjà parfaitement à jour.")
+        print("Tous les prix WooCommerce autorisés sont déjà parfaitement à jour.")
+
+    # RAPPORT DE SÉCURITÉ EN CONSOLE
+    if produits_en_alerte:
+        print("\n⚠️ --- ALERTE : PRODUITS NÉCESSITANT UNE VÉRIFICATION MANUELLE ---")
+        for p in produits_en_alerte:
+            print(f"  • SKU {p['SKU']} ({p['Nom']}) | Prix actuel : {p['Prix_Actuel']}€ | Motif : {p['Statut']}")
+        print("--------------------------------------------------------------------\n")
 
     if 'SKU_Clean' in df_matrice.columns:
         df_matrice.drop(columns=['SKU_Clean'], inplace=True)
