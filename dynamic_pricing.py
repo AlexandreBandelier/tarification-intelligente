@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import time
 import pandas as pd
 import requests
@@ -36,85 +37,113 @@ def to_float(val, default=0.0):
 def extraire_infos_url(url):
     """
     Extrait le prix et le stock depuis l'URL d'un fournisseur/concurrent.
-    Utilise BeautifulSoup + JSON-LD + Meta OpenGraph.
+    Combine : JSON-LD étendu + Meta OpenGraph + Sélecteurs CSS fréquents.
     """
     if not url or pd.isna(url) or not str(url).strip().startswith("http"):
         return None, "hors stock"
 
     clean_url = str(url).strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
     }
 
     try:
         resp = requests.get(clean_url, headers=headers, timeout=12)
         if resp.status_code != 200:
-            print(f"Blocage ou lien mort sur {clean_url} (Code HTTP: {resp.status_code})")
+            print(f"Blocage HTTP {resp.status_code} sur {clean_url}")
             return None, "hors stock"
 
         soup = BeautifulSoup(resp.text, "html.parser")
         prix = None
         dispo = "hors stock"
 
-        # 1. Scraping via Données Structurées JSON-LD (Schema.org)
+        # --- NIVEAU 1 : PARSING JSON-LD ÉTENDU ---
         scripts_json_ld = soup.find_all("script", type="application/ld+json")
         for script in scripts_json_ld:
             if not script.string:
                 continue
             try:
                 data = json.loads(script.string)
-                items = data if isinstance(data, list) else [data]
+                # Gestion du format @graph
+                items = data.get("@graph", data) if isinstance(data, dict) else data
+                if not isinstance(items, list):
+                    items = [items]
+
                 for item in items:
-                    if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct"]:
+                    if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct", "ProductModel"]:
                         offers = item.get("offers", {})
                         if isinstance(offers, list) and offers:
                             offers = offers[0]
                         if isinstance(offers, dict):
-                            prix_val = offers.get("price") or offers.get("lowPrice")
+                            prix_val = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
                             if prix_val:
                                 prix = to_float(prix_val)
                             
                             availability = str(offers.get("availability", "")).lower()
-                            if "instock" in availability or "in_stock" in availability:
+                            if any(k in availability for k in ["instock", "in_stock", "limitedavailability"]):
                                 dispo = "en stock"
                             elif "outofstock" in availability:
                                 dispo = "hors stock"
             except Exception:
                 continue
 
-        # 2. Fallback via Balises Meta OpenGraph / Product
+        # --- NIVEAU 2 : BALISES META (OpenGraph / Schema) ---
         if prix is None or prix <= 0:
-            meta_price = soup.find("meta", property=["og:price:amount", "product:price:amount"]) or soup.find("meta", attrs={"name": "price"})
+            meta_price = (
+                soup.find("meta", property=["og:price:amount", "product:price:amount"])
+                or soup.find("meta", attrs={"name": ["price", "twitter:label1"]})
+                or soup.find("meta", itemprop="price")
+            )
             if meta_price and meta_price.get("content"):
                 prix = to_float(meta_price["content"])
 
         if dispo == "hors stock":
-            meta_avail = soup.find("meta", property=["og:availability", "product:availability"])
+            meta_avail = soup.find("meta", property=["og:availability", "product:availability"]) or soup.find("meta", itemprop="availability")
             if meta_avail and meta_avail.get("content"):
                 content = meta_avail["content"].lower()
                 if any(k in content for k in ["instock", "in stock", "available"]):
                     dispo = "en stock"
 
-        # 3. Fallback par inspection du texte HTML
+        # --- NIVEAU 3 : SÉLECTEURS CSS FRÉQUENTS (E-COMMERCE) ---
+        if prix is None or prix <= 0:
+            selectors_prix = [
+                ".price", ".product-price", ".current-price", ".price-wrapper",
+                "[data-product-price]", ".amount", "#price-value", ".price-box"
+            ]
+            for sel in selectors_prix:
+                element = soup.select_one(sel)
+                if element:
+                    texte = element.get_text()
+                    # Extrait le premier nombre décimal trouvé dans le texte (ex: "12,90 €" -> 12.90)
+                    match = re.search(r'(\d+[\.,]\d{2})', texte)
+                    if match:
+                        prix_pot = to_float(match.group(1))
+                        if prix_pot > 0:
+                            prix = prix_pot
+                            break
+
+        # --- NIVEAU 4 : DÉTECTION DU STOCK DANS LE TEXTE ---
         if dispo == "hors stock":
             page_text = soup.get_text().lower()
-            if any(term in page_text for term in ["en stock", "in stock", "disponible", "ajouter au panier"]):
-                if not any(term in page_text for term in ["rupture de stock", "out of stock", "épuisé"]):
+            mots_clefs_stock = ["en stock", "in stock", "in stock", "disponible", "add to cart", "ajouter au panier"]
+            mots_clefs_rupture = ["rupture de stock", "out of stock", "sold out", "épuisé", "indisponible"]
+
+            if any(term in page_text for term in mots_clefs_stock):
+                if not any(term in page_text for term in mots_clefs_rupture):
                     dispo = "en stock"
 
         if prix and prix > 0:
             print(f"Scraping réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
         else:
-            print(f"Échec extraction prix [{clean_url}] (Structure HTML non reconnue ou rendu JS)")
+            print(f"Échec extraction prix [{clean_url}] (Rendu JS probable ou anti-bot)")
 
         return prix, dispo
 
     except Exception as e:
         print(f"Erreur lors du scraping de l'URL {clean_url} : {e}")
         return None, "hors stock"
-
 
 # --- 1. CONNEXION ET LECTURE GOOGLE SHEETS VIA API ---
 print("Étape 1 : Connexion à Google Sheets...")
