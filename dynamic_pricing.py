@@ -34,10 +34,13 @@ def to_float(val, default=0.0):
     except (ValueError, TypeError):
         return float(default)
 
+from playwright.sync_api import sync_playwright
+
+from playwright.sync_api import sync_playwright
+
 def extraire_infos_url(url):
     """
     Extrait le prix et le stock via Playwright (rendu JS complet).
-    Compatible avec Shopware, Shopify, Magento, WooCommerce, React/Vue stores.
     """
     if not url or pd.isna(url) or not str(url).strip().startswith("http"):
         return None, "hors stock"
@@ -48,7 +51,6 @@ def extraire_infos_url(url):
 
     try:
         with sync_playwright() as p:
-            # Lancement d'un navigateur headless
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -56,11 +58,11 @@ def extraire_infos_url(url):
             )
             page = context.new_page()
             
-            # Chargement de la page et attente du rendu
+            # Chargement de la page et attente du rendu JS
             page.goto(clean_url, timeout=20000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500) # Laisse 2.5s au JS pour charger le prix
+            page.wait_for_timeout(2500)
 
-            # 1. Extraction JSON-LD post-rendu
+            # 1. Extraction via JSON-LD
             scripts_json_ld = page.locator('script[type="application/ld+json"]').all_inner_texts()
             for script_text in scripts_json_ld:
                 try:
@@ -70,7 +72,7 @@ def extraire_infos_url(url):
                         items = [items]
 
                     for item in items:
-                        if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct"]:
+                        if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct", "ProductModel"]:
                             offers = item.get("offers", {})
                             if isinstance(offers, list) and offers:
                                 offers = offers[0]
@@ -85,9 +87,9 @@ def extraire_infos_url(url):
                 except Exception:
                     continue
 
-            # 2. Si le JSON-LD n'a pas suffi, inspection du DOM rendu
+            # 2. Secours : Sélecteurs CSS si le JSON-LD échoue
             if prix is None or prix <= 0:
-                sélecteurs_prix = [
+                selecteurs_prix = [
                     'meta[itemprop="price"]',
                     '.product-detail-price',
                     '.price-unit',
@@ -95,7 +97,7 @@ def extraire_infos_url(url):
                     '.price',
                     '.amount'
                 ]
-                for sel in sélecteurs_prix:
+                for sel in selecteurs_prix:
                     loc = page.locator(sel).first
                     if loc.count() > 0:
                         content = loc.get_attribute("content") or loc.inner_text()
@@ -106,7 +108,7 @@ def extraire_infos_url(url):
                                 prix = prix_pot
                                 break
 
-            # 3. Détection du stock dans le DOM
+            # 3. Détection du stock
             if dispo == "hors stock":
                 body_text = page.locator("body").inner_text().lower()
                 mots_stock = ["in stock", "en stock", "disponible", "add to cart", "ajouter au panier"]
@@ -128,7 +130,6 @@ def extraire_infos_url(url):
     except Exception as e:
         print(f"⚠️ Erreur Playwright sur l'URL {clean_url} : {e}")
         return None, "hors stock"
-
 
 # --- 1. CONNEXION ET LECTURE GOOGLE SHEETS VIA API ---
 print("Étape 1 : Connexion à Google Sheets...")
@@ -434,7 +435,7 @@ def mettre_a_jour_prix():
             if col_name in headers and col_name in df_matrice.columns:
                 col_idx = headers.index(col_name) + 1
                 vals = [[val] for val in df_matrice[col_name].fillna("").tolist()]
-                worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_idx)}", vals)
+                worksheet.update(range_name=f"{gspread.utils.rowcol_to_a1(2, col_idx)}", values=vals)
         
         print("Données extraites et calculs mis à jour avec succès dans le Google Sheet !")
     except Exception as e:
