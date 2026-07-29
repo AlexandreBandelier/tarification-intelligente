@@ -1,8 +1,8 @@
 import os
 import sys
 import json
-import re
 import time
+import re
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -37,113 +37,119 @@ def to_float(val, default=0.0):
 def extraire_infos_url(url):
     """
     Extrait le prix et le stock depuis l'URL d'un fournisseur/concurrent.
-    Combine : JSON-LD étendu + Meta OpenGraph + Sélecteurs CSS fréquents.
+    Compatible avec Shopware (Tokaido), WooCommerce, Shopify, Magento, PrestaShop.
     """
     if not url or pd.isna(url) or not str(url).strip().startswith("http"):
         return None, "hors stock"
 
     clean_url = str(url).strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
     }
 
     try:
         resp = requests.get(clean_url, headers=headers, timeout=12)
         if resp.status_code != 200:
-            print(f"Blocage HTTP {resp.status_code} sur {clean_url}")
+            print(f"⚠️ Erreur HTTP {resp.status_code} sur {clean_url}")
             return None, "hors stock"
 
         soup = BeautifulSoup(resp.text, "html.parser")
         prix = None
         dispo = "hors stock"
 
-        # --- NIVEAU 1 : PARSING JSON-LD ÉTENDU ---
-        scripts_json_ld = soup.find_all("script", type="application/ld+json")
-        for script in scripts_json_ld:
-            if not script.string:
-                continue
-            try:
-                data = json.loads(script.string)
-                # Gestion du format @graph
-                items = data.get("@graph", data) if isinstance(data, dict) else data
-                if not isinstance(items, list):
-                    items = [items]
+        # --- NIVEAU 1 : BALISES META ITEMPROP (Surtout Shopware/Tokaido & PrestaShop) ---
+        meta_itemprop = soup.find("meta", itemprop="price") or soup.find("span", itemprop="price")
+        if meta_itemprop:
+            val_content = meta_itemprop.get("content") or meta_itemprop.get_text()
+            prix = to_float(val_content)
 
-                for item in items:
-                    if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct", "ProductModel"]:
-                        offers = item.get("offers", {})
-                        if isinstance(offers, list) and offers:
-                            offers = offers[0]
-                        if isinstance(offers, dict):
-                            prix_val = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
-                            if prix_val:
-                                prix = to_float(prix_val)
-                            
-                            availability = str(offers.get("availability", "")).lower()
-                            if any(k in availability for k in ["instock", "in_stock", "limitedavailability"]):
-                                dispo = "en stock"
-                            elif "outofstock" in availability:
-                                dispo = "hors stock"
-            except Exception:
-                continue
+        # --- NIVEAU 2 : DONNÉES STRUCTURÉES JSON-LD (Schema.org) ---
+        if prix is None or prix <= 0:
+            scripts_json_ld = soup.find_all("script", type="application/ld+json")
+            for script in scripts_json_ld:
+                if not script.string:
+                    continue
+                try:
+                    data = json.loads(script.string)
+                    items = data.get("@graph", data) if isinstance(data, dict) else data
+                    if not isinstance(items, list):
+                        items = [items]
 
-        # --- NIVEAU 2 : BALISES META (OpenGraph / Schema) ---
+                    for item in items:
+                        if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct", "ProductModel"]:
+                            offers = item.get("offers", {})
+                            if isinstance(offers, list) and offers:
+                                offers = offers[0]
+                            if isinstance(offers, dict):
+                                prix_val = offers.get("price") or offers.get("lowPrice")
+                                if prix_val:
+                                    prix = to_float(prix_val)
+                                
+                                availability = str(offers.get("availability", "")).lower()
+                                if any(k in availability for k in ["instock", "in_stock", "limitedavailability"]):
+                                    dispo = "en stock"
+                                elif "outofstock" in availability:
+                                    dispo = "hors stock"
+                except Exception:
+                    continue
+
+        # --- NIVEAU 3 : META OPENGRAPH & TWITTER ---
         if prix is None or prix <= 0:
             meta_price = (
                 soup.find("meta", property=["og:price:amount", "product:price:amount"])
                 or soup.find("meta", attrs={"name": ["price", "twitter:label1"]})
-                or soup.find("meta", itemprop="price")
             )
             if meta_price and meta_price.get("content"):
                 prix = to_float(meta_price["content"])
 
-        if dispo == "hors stock":
-            meta_avail = soup.find("meta", property=["og:availability", "product:availability"]) or soup.find("meta", itemprop="availability")
-            if meta_avail and meta_avail.get("content"):
-                content = meta_avail["content"].lower()
-                if any(k in content for k in ["instock", "in stock", "available"]):
-                    dispo = "en stock"
-
-        # --- NIVEAU 3 : SÉLECTEURS CSS FRÉQUENTS (E-COMMERCE) ---
+        # --- NIVEAU 4 : SÉLECTEURS CSS DÉDIÉS E-COMMERCE (Shopware, Woo, Shopify) ---
         if prix is None or prix <= 0:
             selectors_prix = [
-                ".price", ".product-price", ".current-price", ".price-wrapper",
-                "[data-product-price]", ".amount", "#price-value", ".price-box"
+                ".product-detail-price", ".price-unit", ".product-price", 
+                ".current-price", ".price-wrapper", "[data-product-price]", 
+                ".amount", "#price-value", ".price-box", ".price"
             ]
             for sel in selectors_prix:
                 element = soup.select_one(sel)
                 if element:
-                    texte = element.get_text()
-                    # Extrait le premier nombre décimal trouvé dans le texte (ex: "12,90 €" -> 12.90)
-                    match = re.search(r'(\d+[\.,]\d{2})', texte)
+                    texte = element.get_text().strip()
+                    # Extrait un prix décimal ou entier (ex: 5.00, 5,00, 5 €)
+                    match = re.search(r'(\d+[\.,]?\d{0,2})\s*(?:€|\$|EUR)?', texte)
                     if match:
                         prix_pot = to_float(match.group(1))
                         if prix_pot > 0:
                             prix = prix_pot
                             break
 
-        # --- NIVEAU 4 : DÉTECTION DU STOCK DANS LE TEXTE ---
+        # --- DÉTECTION DU STOCK DANS LES META ET TEXTE ---
+        meta_avail = soup.find("meta", property=["og:availability", "product:availability"]) or soup.find("meta", itemprop="availability")
+        if meta_avail and meta_avail.get("content"):
+            content = meta_avail["content"].lower()
+            if any(k in content for k in ["instock", "in stock", "available"]):
+                dispo = "en stock"
+
         if dispo == "hors stock":
             page_text = soup.get_text().lower()
-            mots_clefs_stock = ["en stock", "in stock", "in stock", "disponible", "add to cart", "ajouter au panier"]
-            mots_clefs_rupture = ["rupture de stock", "out of stock", "sold out", "épuisé", "indisponible"]
+            mots_stock = ["in stock", "en stock", "disponible", "ready to ship", "add to cart", "ajouter au panier"]
+            mots_rupture = ["out of stock", "rupture de stock", "sold out", "épuisé", "currently unavailable"]
 
-            if any(term in page_text for term in mots_clefs_stock):
-                if not any(term in page_text for term in mots_clefs_rupture):
+            if any(m in page_text for m in mots_stock):
+                if not any(r in page_text for r in mots_rupture):
                     dispo = "en stock"
 
         if prix and prix > 0:
-            print(f"Scraping réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
+            print(f"✅ Scraping réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
         else:
-            print(f"Échec extraction prix [{clean_url}] (Rendu JS probable ou anti-bot)")
+            print(f"❌ Échec extraction [{clean_url}] -> Prix non détecté.")
 
         return prix, dispo
 
     except Exception as e:
-        print(f"Erreur lors du scraping de l'URL {clean_url} : {e}")
+        print(f"⚠️ Erreur lors du scraping de l'URL {clean_url} : {e}")
         return None, "hors stock"
+
 
 # --- 1. CONNEXION ET LECTURE GOOGLE SHEETS VIA API ---
 print("Étape 1 : Connexion à Google Sheets...")
@@ -168,7 +174,7 @@ try:
     worksheet = sh.sheet1
     data = worksheet.get_all_records()
     df_matrice = pd.DataFrame(data)
-    print("Matrice de prix chargée avec succès depuis Google Sheets !")
+    print("✅ Matrice de prix chargée avec succès depuis Google Sheets !")
 except Exception as e:
     print(f"Erreur lors de l'accès au Google Sheet : {e}")
     sys.exit(1)
@@ -378,13 +384,12 @@ def mettre_a_jour_prix():
             if url_col in row and str(row.get(url_col)).strip().startswith("http"):
                 scraped_prix, scraped_dispo = extraire_infos_url(row.get(url_col))
                 
-                # Injection dans la ligne temporaire
-                if scraped_prix and scraped_prix > 0:
-                    row[f"Prix_Concurrent_{num}"] = scraped_prix
+                # Mise à jour dans la ligne locale et globale
+                val_prix_final = scraped_prix if (scraped_prix and scraped_prix > 0) else ""
+                row[f"Prix_Concurrent_{num}"] = val_prix_final
                 row[f"Dispo_Concurrent_{num}"] = scraped_dispo
 
-                # Sauvegarde dans le DataFrame global pour écriture dans Google Sheet
-                df_matrice.loc[df_matrice["Clave_Unique"] == cle_recherche, f"Prix_Concurrent_{num}"] = scraped_prix
+                df_matrice.loc[df_matrice["Clave_Unique"] == cle_recherche, f"Prix_Concurrent_{num}"] = val_prix_final
                 df_matrice.loc[df_matrice["Clave_Unique"] == cle_recherche, f"Dispo_Concurrent_{num}"] = scraped_dispo
 
         total_sales_produit = int(produit.get("total_sales") or 0)
@@ -435,12 +440,11 @@ def mettre_a_jour_prix():
         if col_temp in df_matrice.columns:
             df_matrice.drop(columns=[col_temp], inplace=True)
 
-    # --- 5. ÉCRITURE ET MISE À JOUR COMPLETE DU GOOGLE SHEET ---
+    # --- 5. ÉCRITURE ET MISE À JOUR DANS GOOGLE SHEETS ---
     print("Mise à jour du Google Sheet en ligne (Prix calculés + Données extraites)...")
     try:
         headers = worksheet.row_values(1)
         
-        # Liste des colonnes à réécrire dans le Google Sheet
         colonnes_a_mettre_a_jour = [
             "Prix_Concurrent_1", "Dispo_Concurrent_1",
             "Prix_Concurrent_2", "Dispo_Concurrent_2",
