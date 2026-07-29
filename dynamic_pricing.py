@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 from woocommerce import API
+from playwright.sync_api import sync_playwright
 
 # --- 0. PARAMÈTRES DE SÉCURITÉ ET FONCTIONS UTILITAIRES ---
 SEUIL_VARIATION_MAX = 0.25 
@@ -33,52 +34,43 @@ def to_float(val, default=0.0):
     except (ValueError, TypeError):
         return float(default)
 
-
 def extraire_infos_url(url):
     """
-    Extrait le prix et le stock depuis l'URL d'un fournisseur/concurrent.
-    Compatible avec Shopware (Tokaido), WooCommerce, Shopify, Magento, PrestaShop.
+    Extrait le prix et le stock via Playwright (rendu JS complet).
+    Compatible avec Shopware, Shopify, Magento, WooCommerce, React/Vue stores.
     """
     if not url or pd.isna(url) or not str(url).strip().startswith("http"):
         return None, "hors stock"
 
     clean_url = str(url).strip()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-    }
+    prix = None
+    dispo = "hors stock"
 
     try:
-        resp = requests.get(clean_url, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            print(f"⚠️ Erreur HTTP {resp.status_code} sur {clean_url}")
-            return None, "hors stock"
+        with sync_playwright() as p:
+            # Lancement d'un navigateur headless
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                locale="fr-FR"
+            )
+            page = context.new_page()
+            
+            # Chargement de la page et attente du rendu
+            page.goto(clean_url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500) # Laisse 2.5s au JS pour charger le prix
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        prix = None
-        dispo = "hors stock"
-
-        # --- NIVEAU 1 : BALISES META ITEMPROP (Surtout Shopware/Tokaido & PrestaShop) ---
-        meta_itemprop = soup.find("meta", itemprop="price") or soup.find("span", itemprop="price")
-        if meta_itemprop:
-            val_content = meta_itemprop.get("content") or meta_itemprop.get_text()
-            prix = to_float(val_content)
-
-        # --- NIVEAU 2 : DONNÉES STRUCTURÉES JSON-LD (Schema.org) ---
-        if prix is None or prix <= 0:
-            scripts_json_ld = soup.find_all("script", type="application/ld+json")
-            for script in scripts_json_ld:
-                if not script.string:
-                    continue
+            # 1. Extraction JSON-LD post-rendu
+            scripts_json_ld = page.locator('script[type="application/ld+json"]').all_inner_texts()
+            for script_text in scripts_json_ld:
                 try:
-                    data = json.loads(script.string)
+                    data = json.loads(script_text)
                     items = data.get("@graph", data) if isinstance(data, dict) else data
                     if not isinstance(items, list):
                         items = [items]
 
                     for item in items:
-                        if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct", "ProductModel"]:
+                        if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct"]:
                             offers = item.get("offers", {})
                             if isinstance(offers, list) and offers:
                                 offers = offers[0]
@@ -90,64 +82,51 @@ def extraire_infos_url(url):
                                 availability = str(offers.get("availability", "")).lower()
                                 if any(k in availability for k in ["instock", "in_stock", "limitedavailability"]):
                                     dispo = "en stock"
-                                elif "outofstock" in availability:
-                                    dispo = "hors stock"
                 except Exception:
                     continue
 
-        # --- NIVEAU 3 : META OPENGRAPH & TWITTER ---
-        if prix is None or prix <= 0:
-            meta_price = (
-                soup.find("meta", property=["og:price:amount", "product:price:amount"])
-                or soup.find("meta", attrs={"name": ["price", "twitter:label1"]})
-            )
-            if meta_price and meta_price.get("content"):
-                prix = to_float(meta_price["content"])
+            # 2. Si le JSON-LD n'a pas suffi, inspection du DOM rendu
+            if prix is None or prix <= 0:
+                sélecteurs_prix = [
+                    'meta[itemprop="price"]',
+                    '.product-detail-price',
+                    '.price-unit',
+                    '.product-price',
+                    '.price',
+                    '.amount'
+                ]
+                for sel in sélecteurs_prix:
+                    loc = page.locator(sel).first
+                    if loc.count() > 0:
+                        content = loc.get_attribute("content") or loc.inner_text()
+                        match = re.search(r'(\d+[\.,]?\d{0,2})', content)
+                        if match:
+                            prix_pot = to_float(match.group(1))
+                            if prix_pot > 0:
+                                prix = prix_pot
+                                break
 
-        # --- NIVEAU 4 : SÉLECTEURS CSS DÉDIÉS E-COMMERCE (Shopware, Woo, Shopify) ---
-        if prix is None or prix <= 0:
-            selectors_prix = [
-                ".product-detail-price", ".price-unit", ".product-price", 
-                ".current-price", ".price-wrapper", "[data-product-price]", 
-                ".amount", "#price-value", ".price-box", ".price"
-            ]
-            for sel in selectors_prix:
-                element = soup.select_one(sel)
-                if element:
-                    texte = element.get_text().strip()
-                    # Extrait un prix décimal ou entier (ex: 5.00, 5,00, 5 €)
-                    match = re.search(r'(\d+[\.,]?\d{0,2})\s*(?:€|\$|EUR)?', texte)
-                    if match:
-                        prix_pot = to_float(match.group(1))
-                        if prix_pot > 0:
-                            prix = prix_pot
-                            break
+            # 3. Détection du stock dans le DOM
+            if dispo == "hors stock":
+                body_text = page.locator("body").inner_text().lower()
+                mots_stock = ["in stock", "en stock", "disponible", "add to cart", "ajouter au panier"]
+                mots_rupture = ["out of stock", "rupture de stock", "sold out", "épuisé"]
 
-        # --- DÉTECTION DU STOCK DANS LES META ET TEXTE ---
-        meta_avail = soup.find("meta", property=["og:availability", "product:availability"]) or soup.find("meta", itemprop="availability")
-        if meta_avail and meta_avail.get("content"):
-            content = meta_avail["content"].lower()
-            if any(k in content for k in ["instock", "in stock", "available"]):
-                dispo = "en stock"
+                if any(m in body_text for m in mots_stock):
+                    if not any(r in body_text for r in mots_rupture):
+                        dispo = "en stock"
 
-        if dispo == "hors stock":
-            page_text = soup.get_text().lower()
-            mots_stock = ["in stock", "en stock", "disponible", "ready to ship", "add to cart", "ajouter au panier"]
-            mots_rupture = ["out of stock", "rupture de stock", "sold out", "épuisé", "currently unavailable"]
-
-            if any(m in page_text for m in mots_stock):
-                if not any(r in page_text for r in mots_rupture):
-                    dispo = "en stock"
+            browser.close()
 
         if prix and prix > 0:
-            print(f"✅ Scraping réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
+            print(f"✅ Scraping Playwright réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
         else:
-            print(f"❌ Échec extraction [{clean_url}] -> Prix non détecté.")
+            print(f"❌ Échec extraction Playwright [{clean_url}]")
 
         return prix, dispo
 
     except Exception as e:
-        print(f"⚠️ Erreur lors du scraping de l'URL {clean_url} : {e}")
+        print(f"⚠️ Erreur Playwright sur l'URL {clean_url} : {e}")
         return None, "hors stock"
 
 
