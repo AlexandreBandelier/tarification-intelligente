@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import time
-import re
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -36,28 +35,30 @@ def to_float(val, default=0.0):
 
 def extraire_infos_url(url):
     """
-    Extrait automatiquement le prix et l'état du stock (en stock / hors stock)
-    depuis l'URL d'une fiche produit fournisseur / concurrent.
-    Utilise le parsing JSON-LD (Schema.org), balises Meta et fallback HTML.
+    Extrait le prix et le stock depuis l'URL d'un fournisseur/concurrent.
+    Utilise BeautifulSoup + JSON-LD + Meta OpenGraph.
     """
     if not url or pd.isna(url) or not str(url).strip().startswith("http"):
         return None, "hors stock"
 
+    clean_url = str(url).strip()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
     try:
-        resp = requests.get(str(url).strip(), headers=headers, timeout=10)
+        resp = requests.get(clean_url, headers=headers, timeout=12)
         if resp.status_code != 200:
+            print(f"Blocage ou lien mort sur {clean_url} (Code HTTP: {resp.status_code})")
             return None, "hors stock"
 
         soup = BeautifulSoup(resp.text, "html.parser")
         prix = None
         dispo = "hors stock"
 
-        # 1. Extraction via Données Structurées JSON-LD (Present sur 90%+ des e-commerces)
+        # 1. Scraping via Données Structurées JSON-LD (Schema.org)
         scripts_json_ld = soup.find_all("script", type="application/ld+json")
         for script in scripts_json_ld:
             if not script.string:
@@ -103,10 +104,15 @@ def extraire_infos_url(url):
                 if not any(term in page_text for term in ["rupture de stock", "out of stock", "épuisé"]):
                     dispo = "en stock"
 
+        if prix and prix > 0:
+            print(f"Scraping réussi [{clean_url}] -> Prix: {prix}€ | Stock: {dispo}")
+        else:
+            print(f"Échec extraction prix [{clean_url}] (Structure HTML non reconnue ou rendu JS)")
+
         return prix, dispo
 
     except Exception as e:
-        print(f"Erreur lors du scraping de l'URL {url} : {e}")
+        print(f"Erreur lors du scraping de l'URL {clean_url} : {e}")
         return None, "hors stock"
 
 
@@ -187,7 +193,6 @@ def calculer_prix_dynamique(row):
     if prix_comp is None or prix_comp <= 0:
         is_monopole = True
         
-        # Repli sur le prix standard UNIQUEMENT SI on était en dessous
         if dernier_prix < prix_standard:
             if str(row.get("Statut_Stock")).strip().lower() == "stock_faible":
                 nouveau_prix = round(prix_standard * 1.05, 2)
@@ -198,7 +203,6 @@ def calculer_prix_dynamique(row):
             
             return max(nouveau_prix, prix_plancher), statut
         else:
-            # SINON, calcul normal en récupérant le prix concurrent même hors stock
             prix_comp = to_float(row.get("Prix_Concurrent_1"))
             if prix_comp <= 0:
                 prix_comp = to_float(row.get("Prix_Concurrent_2"))
@@ -226,18 +230,15 @@ def calculer_prix_dynamique(row):
     # 5. Application du Corridor Asymétrique
     statut = "OK"
     
-    # Alignement exact -1% si le fournisseur est à moins de 3% de notre prix
     ecart_fournisseur = (prix_standard - prix_comp) / prix_standard if prix_standard > 0 else 0
     if 0 < ecart_fournisseur <= 0.03:
         nouveau_prix = prix_comp * 0.99
         statut = "ALIGNEMENT_PROCHE_COMPETITEUR_-1%"
     else:
         if prix_cible > prix_standard:
-            # Hausse à 95% si contexte monopole, 66% en temps normal
             coeff_hausse = 0.95 if is_monopole else 0.66
             nouveau_prix = prix_standard + ((prix_cible - prix_standard) * coeff_hausse)
         else:
-            # Baisse à 33% pour tous, sauf bestsellers (Top 3%) à 15%
             delta = prix_cible - prix_standard
             if str(row.get("Is_Bestseller")).strip().lower() == "oui":
                 nouveau_prix = prix_standard + (delta * 0.15)
@@ -256,7 +257,7 @@ def calculer_prix_dynamique(row):
     else:
         prix_final = round(prix_final, 2)
 
-    # 7. Barrière de Sécurité Écart Max (Avertissement visuel)
+    # 7. Barrière de Sécurité Écart Max
     variation = abs(prix_final - prix_standard) / prix_standard
     if variation > SEUIL_VARIATION_MAX:
         statut = f"{statut} (-25% attention)"
@@ -271,7 +272,7 @@ def mettre_a_jour_prix():
     print("Récupération des produits depuis WooCommerce...")
     tous_les_produits = []
     page = 1
-    per_page = 50  # Réduit à 50 pour éviter la surcharge serveur HTTP
+    per_page = 50
 
     while True:
         try:
@@ -345,13 +346,18 @@ def mettre_a_jour_prix():
         # --- EXTRACTION EN DIRECT DE L'URL DU FOURNISSEUR / CONCURRENT ---
         for num in ["1", "2"]:
             url_col = f"URL_Concurrent_{num}"
-            if url_col in row and row.get(url_col):
+            if url_col in row and str(row.get(url_col)).strip().startswith("http"):
                 scraped_prix, scraped_dispo = extraire_infos_url(row.get(url_col))
+                
+                # Injection dans la ligne temporaire
                 if scraped_prix and scraped_prix > 0:
                     row[f"Prix_Concurrent_{num}"] = scraped_prix
                 row[f"Dispo_Concurrent_{num}"] = scraped_dispo
 
-        # Injection du statut Bestseller dynamique
+                # Sauvegarde dans le DataFrame global pour écriture dans Google Sheet
+                df_matrice.loc[df_matrice["Clave_Unique"] == cle_recherche, f"Prix_Concurrent_{num}"] = scraped_prix
+                df_matrice.loc[df_matrice["Clave_Unique"] == cle_recherche, f"Dispo_Concurrent_{num}"] = scraped_dispo
+
         total_sales_produit = int(produit.get("total_sales") or 0)
         est_bestseller = (total_sales_produit >= seuil_top_3_percent) and (total_sales_produit > 0)
         row["Is_Bestseller"] = "oui" if est_bestseller else "non"
@@ -386,7 +392,7 @@ def mettre_a_jour_prix():
                     "Nb_Baisses_48h",
                 ] = (current_baisses + 1)
 
-    # Mise à jour WooCommerce par paquets de 100
+    # Synchronisation WooCommerce
     if batch_data:
         print(f"Envoi des modifications pour {len(batch_data)} produits sur WooCommerce...")
         for i in range(0, len(batch_data), 100):
@@ -396,28 +402,31 @@ def mettre_a_jour_prix():
     else:
         print("Tous les prix WooCommerce autorisés sont déjà à jour.")
 
-    # Nettoyage des colonnes temporaires
     for col_temp in ["SKU_Clean", "Clave_Unique"]:
         if col_temp in df_matrice.columns:
             df_matrice.drop(columns=[col_temp], inplace=True)
 
-    # --- 5. ÉCRITURE DANS LE GOOGLE SHEET EN LIGNE ---
-    print("Mise à jour ciblée du Google Sheet en ligne...")
+    # --- 5. ÉCRITURE ET MISE À JOUR COMPLETE DU GOOGLE SHEET ---
+    print("Mise à jour du Google Sheet en ligne (Prix calculés + Données extraites)...")
     try:
         headers = worksheet.row_values(1)
         
-        col_prix = headers.index("Dernier_Prix_Calcule") + 1
-        col_statut = headers.index("Statut_Dernier_Calcul") + 1
+        # Liste des colonnes à réécrire dans le Google Sheet
+        colonnes_a_mettre_a_jour = [
+            "Prix_Concurrent_1", "Dispo_Concurrent_1",
+            "Prix_Concurrent_2", "Dispo_Concurrent_2",
+            "Dernier_Prix_Calcule", "Statut_Dernier_Calcul"
+        ]
+
+        for col_name in colonnes_a_mettre_a_jour:
+            if col_name in headers and col_name in df_matrice.columns:
+                col_idx = headers.index(col_name) + 1
+                vals = [[val] for val in df_matrice[col_name].fillna("").tolist()]
+                worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_idx)}", vals)
         
-        vals_prix = [[val] for val in df_matrice["Dernier_Prix_Calcule"].fillna("").tolist()]
-        vals_statut = [[val] for val in df_matrice["Statut_Dernier_Calcul"].fillna("").tolist()]
-        
-        worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_prix)}", vals_prix)
-        worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_statut)}", vals_statut)
-        
-        print("Seules les colonnes de calcul ont été mises à jour (données sources préservées) !")
+        print("Données extraites et calculs mis à jour avec succès dans le Google Sheet !")
     except Exception as e:
-        print(f"Erreur lors de l'écriture ciblée dans le Google Sheet : {e}")
+        print(f"Erreur lors de l'écriture dans le Google Sheet : {e}")
 
 
 # --- 6. POINT D'ENTRÉE ---
