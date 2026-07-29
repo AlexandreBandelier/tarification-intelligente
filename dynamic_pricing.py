@@ -1,12 +1,16 @@
 import os
 import sys
 import json
+import time
+import re
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 from woocommerce import API
 
-# --- 0. PARAMÈTRES DE SÉCURITÉ ---
+# --- 0. PARAMÈTRES DE SÉCURITÉ ET FONCTIONS UTILITAIRES ---
 SEUIL_VARIATION_MAX = 0.25 
 
 def to_float(val, default=0.0):
@@ -28,6 +32,82 @@ def to_float(val, default=0.0):
         return float(s)
     except (ValueError, TypeError):
         return float(default)
+
+
+def extraire_infos_url(url):
+    """
+    Extrait automatiquement le prix et l'état du stock (en stock / hors stock)
+    depuis l'URL d'une fiche produit fournisseur / concurrent.
+    Utilise le parsing JSON-LD (Schema.org), balises Meta et fallback HTML.
+    """
+    if not url or pd.isna(url) or not str(url).strip().startswith("http"):
+        return None, "hors stock"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"
+    }
+
+    try:
+        resp = requests.get(str(url).strip(), headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None, "hors stock"
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        prix = None
+        dispo = "hors stock"
+
+        # 1. Extraction via Données Structurées JSON-LD (Present sur 90%+ des e-commerces)
+        scripts_json_ld = soup.find_all("script", type="application/ld+json")
+        for script in scripts_json_ld:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if isinstance(item, dict) and item.get("@type") in ["Product", "IndividualProduct"]:
+                        offers = item.get("offers", {})
+                        if isinstance(offers, list) and offers:
+                            offers = offers[0]
+                        if isinstance(offers, dict):
+                            prix_val = offers.get("price") or offers.get("lowPrice")
+                            if prix_val:
+                                prix = to_float(prix_val)
+                            
+                            availability = str(offers.get("availability", "")).lower()
+                            if "instock" in availability or "in_stock" in availability:
+                                dispo = "en stock"
+                            elif "outofstock" in availability:
+                                dispo = "hors stock"
+            except Exception:
+                continue
+
+        # 2. Fallback via Balises Meta OpenGraph / Product
+        if prix is None or prix <= 0:
+            meta_price = soup.find("meta", property=["og:price:amount", "product:price:amount"]) or soup.find("meta", attrs={"name": "price"})
+            if meta_price and meta_price.get("content"):
+                prix = to_float(meta_price["content"])
+
+        if dispo == "hors stock":
+            meta_avail = soup.find("meta", property=["og:availability", "product:availability"])
+            if meta_avail and meta_avail.get("content"):
+                content = meta_avail["content"].lower()
+                if any(k in content for k in ["instock", "in stock", "available"]):
+                    dispo = "en stock"
+
+        # 3. Fallback par inspection du texte HTML
+        if dispo == "hors stock":
+            page_text = soup.get_text().lower()
+            if any(term in page_text for term in ["en stock", "in stock", "disponible", "ajouter au panier"]):
+                if not any(term in page_text for term in ["rupture de stock", "out of stock", "épuisé"]):
+                    dispo = "en stock"
+
+        return prix, dispo
+
+    except Exception as e:
+        print(f"Erreur lors du scraping de l'URL {url} : {e}")
+        return None, "hors stock"
 
 
 # --- 1. CONNEXION ET LECTURE GOOGLE SHEETS VIA API ---
@@ -53,7 +133,7 @@ try:
     worksheet = sh.sheet1
     data = worksheet.get_all_records()
     df_matrice = pd.DataFrame(data)
-    print("✅ Matrice de prix chargée avec succès depuis Google Sheets !")
+    print("Matrice de prix chargée avec succès depuis Google Sheets !")
 except Exception as e:
     print(f"Erreur lors de l'accès au Google Sheet : {e}")
     sys.exit(1)
@@ -90,8 +170,7 @@ def calculer_prix_dynamique(row):
     if to_float(row.get("Nb_Baisses_48h")) >= 3:
         return round(prix_standard, 2), "DISJONCTEUR_ACTIF"
 
-    # 2. Détermination du concurrent cible
-    # Le port concurrent est assumé égal à notre port
+    # 2. Détermination du concurrent / FRS cible
     frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
     prix_comp = None
     is_monopole = False
@@ -138,7 +217,6 @@ def calculer_prix_dynamique(row):
         prix_cible = max(prix_cible, prix_plancher)
 
     # 4. Protection Stock Faible
-    # Remplacement de "Ventes_30_Jours > 5" par la nouvelle condition "Bestseller (Top 3%)"
     if (
         str(row.get("Statut_Stock")).strip().lower() == "stock_faible"
         and str(row.get("Is_Bestseller")).strip().lower() == "oui"
@@ -178,7 +256,7 @@ def calculer_prix_dynamique(row):
     else:
         prix_final = round(prix_final, 2)
 
-    # 7. Barrière de Sécurité Écart Max (Avertissement visuel uniquement)
+    # 7. Barrière de Sécurité Écart Max (Avertissement visuel)
     variation = abs(prix_final - prix_standard) / prix_standard
     if variation > SEUIL_VARIATION_MAX:
         statut = f"{statut} (-25% attention)"
@@ -193,14 +271,37 @@ def mettre_a_jour_prix():
     print("Récupération des produits depuis WooCommerce...")
     tous_les_produits = []
     page = 1
+    per_page = 50  # Réduit à 50 pour éviter la surcharge serveur HTTP
+
     while True:
-        res = wcapi.get("products", params={"per_page": 100, "page": page}).json()
-        if not res or (isinstance(res, dict) and "code" in res):
-            break
-        tous_les_produits.extend(res)
-        if len(res) < 100:
-            break
-        page += 1
+        try:
+            params = {
+                "per_page": per_page,
+                "page": page,
+                "_fields": "id,sku,name,regular_price,total_sales"
+            }
+            res = wcapi.get("products", params=params).json()
+            
+            if not res or (isinstance(res, dict) and "code" in res):
+                break
+                
+            tous_les_produits.extend(res)
+            
+            if len(res) < per_page:
+                break
+                
+            page += 1
+            
+        except Exception as e:
+            print(f"Erreur temporaire page {page} ({e}). Nouvelle tentative dans 2s...")
+            time.sleep(2)
+            res = wcapi.get("products", params=params).json()
+            if not res or (isinstance(res, dict) and "code" in res):
+                break
+            tous_les_produits.extend(res)
+            if len(res) < per_page:
+                break
+            page += 1
 
     print(f"{len(tous_les_produits)} produits récupérés depuis WooCommerce.")
 
@@ -209,9 +310,9 @@ def mettre_a_jour_prix():
     
     if ventes_totales:
         seuil_top_3_percent = pd.Series(ventes_totales).quantile(0.97)
-        print(f"🌟 Seuil Bestseller (Top 3%) calculé à : {seuil_top_3_percent} ventes.")
+        print(f"Seuil Bestseller (Top 3%) calculé à : {seuil_top_3_percent} ventes.")
     else:
-        seuil_top_3_percent = float('inf') # Sécurité si aucun produit n'a de ventes
+        seuil_top_3_percent = float('inf')
 
     if "Code_Site" not in df_matrice.columns:
         df_matrice["Code_Site"] = "FR"
@@ -241,7 +342,16 @@ def mettre_a_jour_prix():
         row = lignes.iloc[0].to_dict()
         row["Dernier_Prix_Applique"] = prix_actuel
 
-        # Injection du statut Bestseller dynamique (remplace la donnée du Sheet)
+        # --- EXTRACTION EN DIRECT DE L'URL DU FOURNISSEUR / CONCURRENT ---
+        for num in ["1", "2"]:
+            url_col = f"URL_Concurrent_{num}"
+            if url_col in row and row.get(url_col):
+                scraped_prix, scraped_dispo = extraire_infos_url(row.get(url_col))
+                if scraped_prix and scraped_prix > 0:
+                    row[f"Prix_Concurrent_{num}"] = scraped_prix
+                row[f"Dispo_Concurrent_{num}"] = scraped_dispo
+
+        # Injection du statut Bestseller dynamique
         total_sales_produit = int(produit.get("total_sales") or 0)
         est_bestseller = (total_sales_produit >= seuil_top_3_percent) and (total_sales_produit > 0)
         row["Is_Bestseller"] = "oui" if est_bestseller else "non"
@@ -276,17 +386,17 @@ def mettre_a_jour_prix():
                     "Nb_Baisses_48h",
                 ] = (current_baisses + 1)
 
-    # Mise à jour WooCommerce
+    # Mise à jour WooCommerce par paquets de 100
     if batch_data:
         print(f"Envoi des modifications pour {len(batch_data)} produits sur WooCommerce...")
         for i in range(0, len(batch_data), 100):
             paquet = batch_data[i : i + 100]
             wcapi.post("products/batch", {"update": paquet})
-        print(f"✅ {len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
+        print(f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
     else:
         print("Tous les prix WooCommerce autorisés sont déjà à jour.")
 
-    # Nettoyage des colonnes de calcul temporaires
+    # Nettoyage des colonnes temporaires
     for col_temp in ["SKU_Clean", "Clave_Unique"]:
         if col_temp in df_matrice.columns:
             df_matrice.drop(columns=[col_temp], inplace=True)
