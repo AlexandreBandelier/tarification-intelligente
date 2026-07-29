@@ -14,19 +14,14 @@ def to_float(val, default=0.0):
     if pd.isna(val) or val is None:
         return float(default)
     
-    # Si c'est déjà un nombre (int ou float)
     if isinstance(val, (int, float)):
         return float(val)
     
-    # Nettoyage de la chaîne de caractères
     s = str(val).strip()
     if not s:
         return float(default)
     
-    # Suppression du symbole € et des espaces insécables
     s = s.replace("€", "").replace("\xa0", "").replace(" ", "").strip()
-    
-    # Remplacement de la virgule par un point
     s = s.replace(",", ".")
     
     try:
@@ -45,7 +40,6 @@ if not google_credentials_json or not drive_id_matrice:
     print("Erreur : Les secrets GOOGLE_CREDENTIALS ou DRIVE_ID_MATRICE sont manquants.")
     sys.exit(1)
 
-# Authentification gspread
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -54,13 +48,12 @@ creds_dict = json.loads(google_credentials_json)
 credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 gc = gspread.authorize(credentials)
 
-# Ouverture de la feuille de calcul
 try:
     sh = gc.open_by_key(drive_id_matrice)
     worksheet = sh.sheet1
     data = worksheet.get_all_records()
     df_matrice = pd.DataFrame(data)
-    print("Matrice de prix chargée avec succès depuis Google Sheets !")
+    print("✅ Matrice de prix chargée avec succès depuis Google Sheets !")
 except Exception as e:
     print(f"Erreur lors de l'accès au Google Sheet : {e}")
     sys.exit(1)
@@ -88,76 +81,93 @@ wcapi = API(
 def calculer_prix_dynamique(row):
     prix_standard = to_float(row.get("Prix_Standard_TTC"))
     prix_plancher = to_float(row.get("Prix_Plancher_TTC"))
+    dernier_prix = to_float(row.get("Dernier_Prix_Applique"))
 
     if prix_standard <= 0:
-        return to_float(row.get("Dernier_Prix_Applique")), "PRIX_STANDARD_INVALID"
+        return dernier_prix, "PRIX_STANDARD_INVALID"
 
     # 1. Protection Disjoncteur
     if to_float(row.get("Nb_Baisses_48h")) >= 3:
         return round(prix_standard, 2), "DISJONCTEUR_ACTIF"
 
     # 2. Détermination du concurrent cible
-    prix_comp, port_comp = None, 0.0
+    # Le port concurrent est assumé égal à notre port
+    frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
+    prix_comp = None
+    is_monopole = False
     
     dispo_1 = str(row.get("Dispo_Concurrent_1") or "").strip().lower()
     dispo_2 = str(row.get("Dispo_Concurrent_2") or "").strip().lower()
 
     if dispo_1 in ["en stock", "in stock", "1", "true", "oui"]:
         prix_comp = to_float(row.get("Prix_Concurrent_1"))
-        port_comp = to_float(row.get("Port_Concurrent_1"))
     elif dispo_2 in ["en stock", "in stock", "1", "true", "oui"]:
         prix_comp = to_float(row.get("Prix_Concurrent_2"))
-        port_comp = to_float(row.get("Port_Concurrent_2"))
 
     # Cas de Rupture Globale des concurrents
     if prix_comp is None or prix_comp <= 0:
-        if str(row.get("Statut_Stock")).strip().lower() == "stock_faible":
-            nouveau_prix = round(prix_standard * 1.05, 2)
-            statut = "REPLI_MONOPOLE_STOCK_FAIBLE"
+        is_monopole = True
+        
+        # Repli sur le prix standard UNIQUEMENT SI on était en dessous
+        if dernier_prix < prix_standard:
+            if str(row.get("Statut_Stock")).strip().lower() == "stock_faible":
+                nouveau_prix = round(prix_standard * 1.05, 2)
+                statut = "REPLI_MONOPOLE_STOCK_FAIBLE"
+            else:
+                nouveau_prix = prix_standard
+                statut = "REPLI_MONOPOLE_STANDARD"
+            
+            return max(nouveau_prix, prix_plancher), statut
         else:
-            nouveau_prix = prix_standard
-            statut = "REPLI_MONOPOLE_STANDARD"
+            # SINON, calcul normal en récupérant le prix concurrent même hors stock
+            prix_comp = to_float(row.get("Prix_Concurrent_1"))
+            if prix_comp <= 0:
+                prix_comp = to_float(row.get("Prix_Concurrent_2"))
+            if prix_comp <= 0:
+                prix_comp = dernier_prix
+
+    # 3. Calcul du Prix Total Cible
+    cout_global_concurrent = prix_comp + frais_port_notre_site
+    prix_fr_brut = to_float(row.get("Prix_FR_Brut"))
+
+    if str(row.get("Zone_Geo")).strip().upper() == "NORD":
+        prix_cible = (cout_global_concurrent * 0.90) - frais_port_notre_site
+        prix_cible = max(prix_cible, prix_fr_brut)
     else:
-        # 3. Calcul du Prix Total Cible
-        cout_global_concurrent = prix_comp + port_comp
-        frais_port_notre_site = to_float(row.get("Frais_Port_Reels_Notre_Site"))
-        prix_fr_brut = to_float(row.get("Prix_FR_Brut"))
+        prix_cible = cout_global_concurrent - frais_port_notre_site
+        prix_cible = max(prix_cible, prix_plancher)
 
-        if str(row.get("Zone_Geo")).strip().upper() == "NORD":
-            prix_cible = (cout_global_concurrent * 0.90) - frais_port_notre_site
-            prix_cible = max(prix_cible, prix_fr_brut)
-        else:
-            prix_cible = cout_global_concurrent - frais_port_notre_site
-            prix_cible = max(prix_cible, prix_plancher)
+    # 4. Protection Stock Faible
+    # Remplacement de "Ventes_30_Jours > 5" par la nouvelle condition "Bestseller (Top 3%)"
+    if (
+        str(row.get("Statut_Stock")).strip().lower() == "stock_faible"
+        and str(row.get("Is_Bestseller")).strip().lower() == "oui"
+    ):
+        return max(prix_standard, dernier_prix), "GEL_STOCK_FAIBLE"
 
-        # 4. Protection Stock Faible
-        if (
-            str(row.get("Statut_Stock")).strip().lower() == "stock_faible"
-            and to_float(row.get("Ventes_30_Jours")) > 5
-        ):
-            return max(
-                prix_standard, to_float(row.get("Dernier_Prix_Applique"))
-            ), "GEL_STOCK_FAIBLE"
-
-        # 5. Application du Corridor Asymétrique
+    # 5. Application du Corridor Asymétrique
+    statut = "OK"
+    
+    # Alignement exact -1% si le fournisseur est à moins de 3% de notre prix
+    ecart_fournisseur = (prix_standard - prix_comp) / prix_standard if prix_standard > 0 else 0
+    if 0 < ecart_fournisseur <= 0.03:
+        nouveau_prix = prix_comp * 0.99
+        statut = "ALIGNEMENT_PROCHE_COMPETITEUR_-1%"
+    else:
         if prix_cible > prix_standard:
-            nouveau_prix = prix_standard + ((prix_cible - prix_standard) * 0.66)
+            # Hausse à 95% si contexte monopole, 66% en temps normal
+            coeff_hausse = 0.95 if is_monopole else 0.66
+            nouveau_prix = prix_standard + ((prix_cible - prix_standard) * coeff_hausse)
         else:
+            # Baisse à 33% pour tous, sauf bestsellers (Top 3%) à 15%
             delta = prix_cible - prix_standard
-            if delta >= -0.10 * prix_standard:
-                coeff = (
-                    0.50
-                    if str(row.get("Is_Bestseller")).strip().lower() in ["oui", "yes", "true", "1"]
-                    else 1.0
-                )
-                nouveau_prix = prix_standard + (delta * coeff)
+            if str(row.get("Is_Bestseller")).strip().lower() == "oui":
+                nouveau_prix = prix_standard + (delta * 0.15)
             else:
                 nouveau_prix = prix_standard + (delta * 0.33)
 
-        if str(row.get("Statut_Stock")).strip().lower() == "surstock":
-            nouveau_prix *= 0.95
-
-        statut = "OK"
+    if str(row.get("Statut_Stock")).strip().lower() == "surstock":
+        nouveau_prix *= 0.95
 
     # 6. Prix Plancher Inviolable
     prix_final = max(nouveau_prix, prix_plancher)
@@ -168,14 +178,10 @@ def calculer_prix_dynamique(row):
     else:
         prix_final = round(prix_final, 2)
 
-    # 7. Barrière de Sécurité Écart Max
+    # 7. Barrière de Sécurité Écart Max (Avertissement visuel uniquement)
     variation = abs(prix_final - prix_standard) / prix_standard
     if variation > SEUIL_VARIATION_MAX:
-        dernier_prix = to_float(row.get("Dernier_Prix_Applique"), prix_standard)
-        return (
-            dernier_prix,
-            f"BLOCAGE_VARIATION_EXCESSIVE_({round(variation*100)}%)",
-        )
+        statut = f"{statut} (-25% attention)"
 
     return prix_final, statut
 
@@ -183,7 +189,6 @@ def calculer_prix_dynamique(row):
 # --- 4. TRAITEMENT ET SYNCHRONISATION ---
 def mettre_a_jour_prix():
     batch_data = []
-    produits_en_alerte = []
 
     print("Récupération des produits depuis WooCommerce...")
     tous_les_produits = []
@@ -198,6 +203,15 @@ def mettre_a_jour_prix():
         page += 1
 
     print(f"{len(tous_les_produits)} produits récupérés depuis WooCommerce.")
+
+    # --- CALCUL DYNAMIQUE DU TOP 3% (BESTSELLERS) ---
+    ventes_totales = [int(p.get("total_sales") or 0) for p in tous_les_produits]
+    
+    if ventes_totales:
+        seuil_top_3_percent = pd.Series(ventes_totales).quantile(0.97)
+        print(f"🌟 Seuil Bestseller (Top 3%) calculé à : {seuil_top_3_percent} ventes.")
+    else:
+        seuil_top_3_percent = float('inf') # Sécurité si aucun produit n'a de ventes
 
     if "Code_Site" not in df_matrice.columns:
         df_matrice["Code_Site"] = "FR"
@@ -227,6 +241,11 @@ def mettre_a_jour_prix():
         row = lignes.iloc[0].to_dict()
         row["Dernier_Prix_Applique"] = prix_actuel
 
+        # Injection du statut Bestseller dynamique (remplace la donnée du Sheet)
+        total_sales_produit = int(produit.get("total_sales") or 0)
+        est_bestseller = (total_sales_produit >= seuil_top_3_percent) and (total_sales_produit > 0)
+        row["Is_Bestseller"] = "oui" if est_bestseller else "non"
+
         nouveau_prix, statut_calcul = calculer_prix_dynamique(row)
 
         df_matrice.loc[
@@ -236,21 +255,7 @@ def mettre_a_jour_prix():
             df_matrice["Clave_Unique"] == cle_recherche, "Statut_Dernier_Calcul"
         ] = statut_calcul
 
-        if "BLOCAGE_VARIATION_EXCESSIVE" in statut_calcul:
-            produits_en_alerte.append(
-                {
-                    "SKU": sku,
-                    "Nom": produit.get("name"),
-                    "Prix_Actuel": prix_actuel,
-                    "Statut": statut_calcul,
-                }
-            )
-
-        if (
-            nouveau_prix > 0
-            and nouveau_prix != prix_actuel
-            and "BLOCAGE" not in statut_calcul
-        ):
+        if nouveau_prix > 0 and nouveau_prix != prix_actuel and "BLOCAGE" not in statut_calcul:
             payload_produit = {
                 "id": produit["id"],
                 "regular_price": str(nouveau_prix),
@@ -277,17 +282,9 @@ def mettre_a_jour_prix():
         for i in range(0, len(batch_data), 100):
             paquet = batch_data[i : i + 100]
             wcapi.post("products/batch", {"update": paquet})
-        print(f"{len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
+        print(f"✅ {len(batch_data)} prix mis à jour avec succès sur WooCommerce.")
     else:
         print("Tous les prix WooCommerce autorisés sont déjà à jour.")
-
-    if produits_en_alerte:
-        print("\n--- ALERTE : PRODUITS NÉCESSITANT UNE VÉRIFICATION MANUELLE ---")
-        for p in produits_en_alerte:
-            print(
-                f"  • SKU {p['SKU']} ({p['Nom']}) | Prix actuel : {p['Prix_Actuel']}€ | Motif : {p['Statut']}"
-            )
-        print("--------------------------------------------------------------------\n")
 
     # Nettoyage des colonnes de calcul temporaires
     for col_temp in ["SKU_Clean", "Clave_Unique"]:
@@ -297,18 +294,14 @@ def mettre_a_jour_prix():
     # --- 5. ÉCRITURE DANS LE GOOGLE SHEET EN LIGNE ---
     print("Mise à jour ciblée du Google Sheet en ligne...")
     try:
-        # Récupération des en-têtes du sheet
         headers = worksheet.row_values(1)
         
-        # Identification des colonnes à mettre à jour
         col_prix = headers.index("Dernier_Prix_Calcule") + 1
         col_statut = headers.index("Statut_Dernier_Calcul") + 1
         
-        # Préparation des plages de mise à jour ciblées
         vals_prix = [[val] for val in df_matrice["Dernier_Prix_Calcule"].fillna("").tolist()]
         vals_statut = [[val] for val in df_matrice["Statut_Dernier_Calcul"].fillna("").tolist()]
         
-        # On ne met à jour QUE ces colonnes précises (ligne 2 jusqu'à la fin)
         worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_prix)}", vals_prix)
         worksheet.update(f"{gspread.utils.rowcol_to_a1(2, col_statut)}", vals_statut)
         
