@@ -30,3 +30,7 @@ jobs:
           WOO_CONSUMER_KEY: ${{ secrets.WOO_CONSUMER_KEY }}
           WOO_CONSUMER_SECRET: ${{ secrets.WOO_CONSUMER_SECRET }}
         run: python dynamic_pricing.py
+        - name: Install Playwright Browsers
+          run: |
+            pip install playwright
+            playwright install chromium --with-deps
